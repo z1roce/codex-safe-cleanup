@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex 专用安全清理"
+  short_description: "覆盖所有 Codex 项目及任务产物，核实来源后全选并确认回收，保护源码、原件和历史"
+  default_prompt: "使用 $codex-safe-cleanup，检查所有 Codex 项目及任务产物，先给我只读预览，不清理文件。"

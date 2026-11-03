@@ -1,0 +1,25 @@
+# Local state and private Codex metadata must never be published.
+inventory-context*.json
+artifact-registry*.json
+discovery-index*.json
+config.json
+panel.json
+panel-controls.json
+*.log
+*.new
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+.codex/
+.agents/
+state/
+*-state/
+*reports/
+*quarantine/
+file-plans/
+dist/
+*.zip
+.env
+.env.*
+
