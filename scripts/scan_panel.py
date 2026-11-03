@@ -303,6 +303,8 @@ def start(state):
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'),
         )
+    # Keep ownership of the process handle until exit, including detached startup.
+    threading.Thread(target=child.wait,daemon=True).start()
     for _ in range(50):
         if child.poll() is not None:
             raise RuntimeError('面板启动失败，请检查 panel-service.log')

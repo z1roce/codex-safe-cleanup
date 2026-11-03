@@ -44,8 +44,12 @@ class PanelTests(unittest.TestCase):
     def request(self,path,post=False,data=None,headers=None):
         h={'X-Codex-Panel':self.panel.token,'Content-Type':'application/json'} if post else {}
         h.update(headers or {})
-        return urlopen(Request(self.url+path,data=json.dumps(data).encode() if data is not None else None,
-                              method='POST' if post else 'GET',headers=h),timeout=15)
+        try:
+            return urlopen(Request(self.url+path,data=json.dumps(data).encode() if data is not None else None,
+                                  method='POST' if post else 'GET',headers=h),timeout=15)
+        except HTTPError as error:
+            error.close()
+            raise
 
     def operation(self,route,data):
         with self.request('api/'+route,True,data) as r:jid=json.load(r)['job']

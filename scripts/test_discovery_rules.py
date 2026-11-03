@@ -133,7 +133,10 @@ class DiscoveryRuleTests(unittest.TestCase):
         source.write_text('package demo; public class Hello { public static void main(String[] args) {} }',encoding='utf-8')
         (self.project/'pom.xml').write_text('<project/>')
         output=self.project/'target/classes';output.mkdir(parents=True)
-        subprocess.run([javac,'-encoding','UTF-8','-d',str(output),str(source)],check=True,capture_output=True)
+        result=subprocess.run([javac,'-encoding','UTF-8','-d',str(output),str(source)],capture_output=True)
+        if result.returncode:
+            version=subprocess.run([javac,'-J-XshowSettings:properties','-version'],capture_output=True)
+            self.fail(f'javac exit {result.returncode}\nstdout={result.stdout!r}\nstderr={result.stderr!r}\nJDK={version.stderr!r}')
         file=output/'demo/Hello.class'
         major=struct.unpack('>H',file.read_bytes()[6:8])[0]
         self.assertEqual(len(projects.discover_generated({'java_paths':[str(file)]})),int(52<=major<=69))
