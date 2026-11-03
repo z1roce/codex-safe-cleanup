@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 import inventory
@@ -88,5 +90,127 @@ class FileCleanupTests(unittest.TestCase):
   folder,m=self.engine.get(r['id']);m['entries'][0]['status']='prepared';self.engine.save(folder,m)
   self.assertTrue(self.engine.history()[0]['recoverable'])
   self.engine.restore(r['id']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_restore_ignores_index_keep_git_and_current_scope_after_restart(self):
+  with patch('windows_recycle.native_operation',return_value={'ok':False}):r=self.engine.execute(self.preview()['id'],ACK)
+  (self.file.parent/'.codex-keep').write_text('preserve future files')
+  write_json(self.c.state/'discovery-index.json',{'artifacts':[]})
+  with patch.object(inventory,'candidate_info',return_value=None),patch.object(inventory,'git_tracked_status',return_value=None):
+   FileCleanup(self.c.state).restore(r['id'])
+  self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_restart_after_native_move_without_coordinator_result(self):
+  r=self.engine.execute(self.preview()['id'],ACK);self.assertFalse(r['failed'],r)
+  folder,m=self.engine.get(r['id']);e=m['entries'][0]
+  self.assertTrue((folder/(e['id']+'.receipt')).exists())
+  e.pop('recycle_result');e['status']='recycling';self.engine.save(folder,m)
+  FileCleanup(self.c.state).restore(r['id']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_restart_can_find_exact_recycle_item_without_callback_receipt(self):
+  for variant in ('missing','corrupt'):
+   with self.subTest(receipt=variant):
+    r=self.engine.execute(self.preview()['id'],ACK);self.assertFalse(r['failed'],r)
+    folder,m=self.engine.get(r['id']);e=m['entries'][0];receipt=folder/(e['id']+'.receipt')
+    if variant=='missing':receipt.unlink()
+    else:receipt.write_bytes(b'partial native receipt fixture')
+    e.pop('recycle_result');e['status']='recycling';self.engine.save(folder,m)
+    FileCleanup(self.c.state).restore(r['id']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_restart_after_restore_move_is_idempotent(self):
+  with patch('windows_recycle.native_operation',return_value={'ok':False}):r=self.engine.execute(self.preview()['id'],ACK)
+  folder,m=self.engine.get(r['id']);e=m['entries'][0]
+  e['status']='restoring';self.engine.save(folder,m)
+  os.rename(e['stage'],e['original'])
+  FileCleanup(self.c.state).restore(r['id']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_actual_process_exit_releases_lock_and_recovers_staging_and_shell_receipt(self):
+  code='''
+import os,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import inventory,windows_recycle
+from file_cleanup import FileCleanup,ACK
+inventory.roots=lambda:[Path(sys.argv[3])]
+native=windows_recycle.native_operation
+def interrupted(*args,**kwargs):
+    if sys.argv[5]=='after-shell':native(*args,**kwargs)
+    os._exit(77)
+windows_recycle.native_operation=interrupted
+FileCleanup(sys.argv[2]).execute(sys.argv[4],ACK)
+'''
+  for boundary in ('before-shell','after-shell'):
+   with self.subTest(boundary=boundary):
+    preview=self.preview()
+    result=subprocess.run([sys.executable,'-B','-c',code,str(Path(__file__).parent),str(self.c.state),str(self.root),preview['id'],boundary],timeout=30)
+    self.assertEqual(result.returncode,77)
+    engine=FileCleanup(self.c.state)
+    record=next(r for r in engine.history() if r['recoverable'])
+    engine.restore(record['id']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_partial_failure_reports_unprocessed_selection(self):
+  other=self.file.with_name('user-assist.json');other.write_bytes(b'disposable second cache')
+  report=inventory.run_inventory(self.c.state)
+  preview=self.engine.preview(report['id'],[r['id'] for r in report['candidates']])
+  with patch('windows_recycle.native_operation',return_value={'ok':False}):r=self.engine.execute(preview['id'],ACK)
+  self.assertEqual(r['selected_count'],2);self.assertEqual(r['unprocessed_count'],1)
+  FileCleanup(self.c.state).restore(r['id'])
+  self.assertEqual(self.file.read_bytes(),self.data);self.assertEqual(other.read_bytes(),b'disposable second cache')
+
+ def test_restore_rejects_changed_staged_content(self):
+  with patch('windows_recycle.native_operation',return_value={'ok':False}):r=self.engine.execute(self.preview()['id'],ACK)
+  folder,m=self.engine.get(r['id']);stage=Path(m['entries'][0]['stage']);stage.write_bytes(b'changed test bytes')
+  with self.assertRaises(SafetyError):FileCleanup(self.c.state).restore(r['id'])
+  self.assertFalse(self.file.exists());self.assertEqual(stage.read_bytes(),b'changed test bytes')
+
+ def test_volume_unavailable_after_first_move_keeps_partial_journal(self):
+  other=self.file.with_name('user-assist.json');other.write_bytes(b'disposable second cache')
+  report=inventory.run_inventory(self.c.state)
+  rows={row['path']:row['id'] for row in report['candidates']}
+  preview=self.engine.preview(report['id'],[rows[str(self.file)],rows[str(other)]])
+  import windows_recycle
+  native=windows_recycle.native_operation;original_stat=Path.stat;offline=False
+  def recycle(*args,**kwargs):
+   nonlocal offline
+   result=native(*args,**kwargs);offline=True;return result
+  def unavailable(path,*args,**kwargs):
+   if offline and path==other:raise OSError('synthetic source volume unavailable')
+   return original_stat(path,*args,**kwargs)
+  with patch('windows_recycle.native_operation',side_effect=recycle),patch.object(Path,'stat',unavailable):
+   result=self.engine.execute(preview['id'],ACK)
+  self.assertTrue(result['failed']);self.assertTrue(result['recoverable'])
+  FileCleanup(self.c.state).restore(result['id'])
+  self.assertEqual(self.file.read_bytes(),self.data);self.assertEqual(other.read_bytes(),b'disposable second cache')
+
+ def test_offline_staging_does_not_lose_record_or_allow_other_moves(self):
+  with patch('windows_recycle.native_operation',return_value={'ok':False}):r=self.engine.execute(self.preview()['id'],ACK)
+  folder,m=self.engine.get(r['id']);stage=Path(m['entries'][0]['stage']);hidden=stage.with_suffix('.offline')
+  stage.rename(hidden)
+  with self.assertRaises((OSError,SafetyError)):FileCleanup(self.c.state).restore(r['id'])
+  self.assertTrue((folder/'manifest.json').is_file())
+  hidden.rename(stage);FileCleanup(self.c.state).restore(r['id'])
+  self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_stage_permission_failure_does_not_move_source(self):
+  preview=self.preview()
+  real_mkdir=Path.mkdir
+  def denied(path,*args,**kwargs):
+   if self.engine.records in path.parents and path.parent!=self.engine.records:raise PermissionError('synthetic staging denial')
+   return real_mkdir(path,*args,**kwargs)
+  with patch.object(Path,'mkdir',denied):r=self.engine.execute(preview['id'],ACK)
+  self.assertTrue(r['failed']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ @unittest.skipUnless(os.environ.get('CLEANUP_CROSS_VOLUME_ROOT'),'Dedicated second-volume fixture root required')
+ def test_real_multi_volume_batch_recycle_restart_restore(self):
+  with tempfile.TemporaryDirectory(prefix='清理 cross volume ',dir=os.environ['CLEANUP_CROSS_VOLUME_ROOT']) as folder:
+   root=Path(folder)/'.codex';other=root/self.file.relative_to(self.root)
+   other.parent.mkdir(parents=True);other.write_bytes(b'disposable second volume')
+   self.assertNotEqual(root.stat().st_dev,self.c.state.stat().st_dev)
+   with patch.object(inventory,'roots',return_value=[self.root,root]):
+    report=inventory.run_inventory(self.c.state)
+    preview=self.engine.preview(report['id'],[r['id'] for r in report['candidates']])
+    result=self.engine.execute(preview['id'],ACK);self.assertFalse(result['failed'],result)
+    FileCleanup(self.c.state).restore(result['id'])
+   self.assertEqual(self.file.read_bytes(),self.data)
+   self.assertEqual(other.read_bytes(),b'disposable second volume')
 
 if __name__=='__main__':unittest.main(verbosity=2)

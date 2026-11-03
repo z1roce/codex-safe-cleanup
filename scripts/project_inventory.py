@@ -11,6 +11,7 @@ HASH_TYPES=set()
 SECRET_NAMES={'.ssh','.aws','.gnupg','credentials','secrets'}
 SECRET_SUFFIXES={'.pem','.key','.keystore','.pfx','.sqlite','.db'}
 CLOUD_FLAGS=0x1000|0x40000|0x400000
+CPYTHON_MAGIC={'312':3531,'313':3571,'314':3627}
 UUID=re.compile(r'^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$',re.I)
 HINTS={'tmp','temp','scratch','render','renders','preview','screenshots','browser-qa','gradle-home','java-user','toolchain','sdk','build','dist','__pycache__'}
 def context(state):return {}
@@ -50,10 +51,11 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
     started = time.monotonic()
     groups, files, coverage = {}, [], []
     bytecode_paths, package_scripts, package_paths = [], [], []
+    pytest_paths,java_paths=[],[]
     skipped = []
     count = 0
     budget_hit = False
-    known = {t['id']: t for t in ctx.get('threads', [])}
+    known = {t['id']: t for t in ctx.get('threads', []) if isinstance(t.get('id'),str)}
     explanations = ctx.get('task_explanations', {})
     codex = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
     def problem(path, why):
@@ -82,17 +84,21 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
             cover['status'] = 'partial'
             problem(getattr(e, 'filename', root), '无法读取：' + str(e))
         for base, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
+            if time.monotonic()-started>=MAX_SECONDS:
+                budget_hit=True;cover['status']='partial_limit';break
             if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消；未清理文件')
             base = Path(base)
             safe_dirs = []
             for name in dirs:
+                if time.monotonic()-started>=MAX_SECONDS:
+                    budget_hit=True;cover['status']='partial_limit';break
                 p = base / name
                 try:
                     s = p.lstat()
-                    if name.lower() in SECRET_NAMES or name.lower() in ('.git', '.hg', '.svn', '.agents', 'skills', 'plugins', 'sessions'):
+                    if name.lower() in SECRET_NAMES or name.lower() in ('.git', '.hg', '.svn', '.agents', 'skills', 'plugins', 'sessions', '.codex-cleanup-staging'):
                         problem(p, '凭据或版本历史保护，未深入统计')
                         continue
-                    if stat.S_ISLNK(s.st_mode) or getattr(s, 'st_file_attributes', 0) & 0x400:
+                    if stat.S_ISLNK(s.st_mode) or getattr(s, 'st_file_attributes', 0) & (0x400|CLOUD_FLAGS):
                         cover['status'] = 'partial'
                         problem(p, '链接、目录联接或云端占位目录，未深入')
                         continue
@@ -121,6 +127,9 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
                     cover['logical_bytes'] += s.st_size
                     if p.suffix.lower()=='.zip':package_paths.append(str(p))
                     if p.suffix=='.pyc' and p.parent.name=='__pycache__':bytecode_paths.append(str(p))
+                    if p.parent.name=='cache' and p.parent.parent.name=='v' and p.parent.parent.parent.name=='.pytest_cache' and p.name in ('nodeids','lastfailed'):
+                        pytest_paths.append(str(p))
+                    if p.suffix=='.class':java_paths.append(str(p))
                     if p.name=='package_release.py' and p.parent.name=='tools':package_scripts.append(str(p))
                     gp = group_path(p, root)
                     g = groups.setdefault(str(gp), dict(path=str(gp), bytes=0, file_count=0,
@@ -217,57 +226,27 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
     report['bytecode_paths']=bytecode_paths
     report['package_scripts']=package_scripts
     report['package_paths']=package_paths
+    report['pytest_paths']=pytest_paths
+    report['java_paths']=java_paths
+    report['evidence_limits']=[{'kind':kind,'discovered':len(paths),'checked_limit':limit}
+        for kind,paths,limit in [('Python 缓存',bytecode_paths,500),('发布脚本',package_scripts,20),
+                                ('pytest 缓存',pytest_paths,500),('Java 编译缓存',java_paths,500)] if len(paths)>limit]
     return report
 
 
 def discover_projects(ctx,codex_roots):
-    proposed=[];omitted=[]
-    home=Path.home()
-    forbidden={home,home/'OneDrive'}
-    for base in (home,home/'OneDrive'):
-        forbidden.update(base/n for n in ('Desktop','Documents','Downloads','Pictures','Videos','Music','文档','桌面','下载'))
-    def add(value,source):
-        if not value:return
-        try:
-            p=absolute(str(value))
-            if p==Path(p.anchor) or p in forbidden or p in codex_roots:
-                omitted.append({'path':str(p),'reason':'通用用户目录或整盘，不能因聊天使用过就扫描全部内容'});return
-            for codex in codex_roots:
-                if any(within(p,codex/n) for n in ('skills','plugins','sessions','backups','.sandbox','.sandbox-secrets')):return
-            if p.exists() and not p.is_dir():return
-            proposed.append({'path':str(p),'sources':[source]})
-        except (OSError,SafetyError,ValueError):return
-    for p in ctx.get('projects',[]):add(p.get('path'),'Codex 登记项目：'+p.get('label','未命名'))
-    for t in ctx.get('threads',[]):add(t.get('cwd'),'Codex 历史任务工作目录')
-    for codex in codex_roots:
-        add(codex/'visualizations','Codex 各任务输出目录')
-        add(codex/'worktrees','Codex 工作副本，仅盘点不删除')
-        state=codex/'.codex-global-state.json'
-        try:
-            no_links(state)
-            data=read_json(state) if state.exists() else {}
-            def paths(value):
-                if isinstance(value,str) and re.match(r'^[A-Za-z]:[\\/]',value):add(value,'Codex 本机项目/任务输出索引')
-                elif isinstance(value,dict):
-                    for v in value.values():paths(v)
-                elif isinstance(value,list):
-                    for v in value:paths(v)
-            for name in ('local-projects','thread-workspace-root-hints','thread-projectless-output-directories'):paths(data.get(name,{}))
-        except (OSError,ValueError,SafetyError):pass
-    result=[]
-    for item in sorted(proposed,key=lambda x:len(Path(x['path']).parts)):
-        parent=next((x for x in result if within(Path(item['path']),Path(x['path']))),None)
-        if parent:
-            parent['sources']=list(dict.fromkeys(parent['sources']+item['sources']))
-        else:result.append(item)
-    return result,omitted
+    from project_discovery import discover
+    return discover(ctx,codex_roots)
 
 
-def scan_projects(state,ctx,codex_roots,progress=None,cancel=None):
+def scan_projects(state,ctx,codex_roots,progress=None,cancel=None,project=None):
     scopes,omitted=discover_projects(ctx,codex_roots)
+    if project is not None:
+        scopes=[scope for scope in scopes if absolute(scope['path'])==absolute(project)]
+        if not scopes:raise SafetyError('只能按已发现或手动登记的项目检查')
     safe_ctx=dict(ctx,threads=[dict(t,title=t.get('title') or '任务标题未核实') for t in ctx.get('threads',[])])
     result=_scan(state,safe_ctx,scopes,progress,cancel)
-    result['complete']=result['complete'] and all(x['status']=='complete' for x in result['coverage'])
+    result['complete']=result['complete'] and not omitted and all(x['status']=='complete' for x in result['coverage'])
     result['scope_omissions']=omitted
     for row in result['items']:
         row['selectable']=False
@@ -277,8 +256,22 @@ def scan_projects(state,ctx,codex_roots,progress=None,cancel=None):
 
 def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
     # Static evidence only: never execute project scripts or infer uselessness from age.
-    import ast,importlib.util,struct
+    import ast,struct
     found=[]
+    evidence_started=time.monotonic();read_bytes=0
+    def bounded_read(path,limit=512*1024):
+        nonlocal read_bytes
+        no_links(path)
+        info=path.stat()
+        if getattr(info,'st_file_attributes',0)&(CLOUD_FLAGS|0x400):raise SafetyError('云端或链接证据文件，继续保留')
+        size=info.st_size
+        if size>limit or read_bytes+size>8*1024**2 or time.monotonic()-evidence_started>5:
+            result.setdefault('evidence_limits',[]).append({'kind':'生成证据','path':str(path),'reason':'单文件/总读取8MiB/5秒预算达到上限，未识别'})
+            raise SafetyError('生成证据读取预算达到上限')
+        with path.open('rb') as stream:data=stream.read(limit+1)
+        read_bytes+=len(data)
+        if len(data)>limit:raise SafetyError('证据读取时文件变化')
+        return data
     def add(path,scope,purpose,proof,category=None):
         try:
             no_links(path);s=path.stat()
@@ -292,16 +285,59 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
         except (OSError,SafetyError):pass
     for name in result.get('bytecode_paths',[])[:500]:
         if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消')
-        p=Path(name);source=p.parent.parent/(p.name.split('.cpython-')[0]+'.py')
+        p=Path(name)
+        match=re.fullmatch(r'(.+)\.cpython-(312|313|314)(?:\.opt-[12])?\.pyc',p.name)
+        if not match:continue
+        source=p.parent.parent/(match[1]+'.py')
         try:
             no_links(p);no_links(source)
             if not source.is_file():continue
+            if getattr(p.stat(),'st_file_attributes',0)&(CLOUD_FLAGS|0x400):continue
             with p.open('rb') as f:header=f.read(16)
-            if len(header)!=16 or header[:4]!=importlib.util.MAGIC_NUMBER:continue
+            magic=CPYTHON_MAGIC[match[2]].to_bytes(2,'little')+b'\r\n'
+            if len(header)!=16 or header[:4]!=magic or p.stat().st_size<=16:continue
             flags=struct.unpack('<I',header[4:8])[0]
             if flags not in (0,1,3):continue
+            if flags==0:
+                stamp,size=struct.unpack('<II',header[8:16]);info=source.stat()
+                if stamp!=(int(info.st_mtime)&0xffffffff) or size!=(info.st_size&0xffffffff):continue
             add(p,p.parent.parent,'Python 根据仍存在的源码自动生成的字节码缓存；不是源码或唯一编译产物。',
                 '已核对 Python 缓存头及对应源码位置：'+str(source))
+        except (OSError,SafetyError):continue
+    for name in result.get('pytest_paths',[])[:500]:
+        if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消')
+        p=Path(name);cache=p.parent.parent.parent
+        try:
+            if p.name not in ('nodeids','lastfailed') or cache.name!='.pytest_cache':continue
+            for marker in (p,cache/'README.md',cache/'CACHEDIR.TAG',cache/'.gitignore'):no_links(marker)
+            if any(marker.stat().st_size>256*1024 for marker in (p,cache/'README.md',cache/'CACHEDIR.TAG',cache/'.gitignore')):continue
+            if not bounded_read(cache/'README.md').decode('utf-8').startswith('# pytest cache directory #'):continue
+            if not bounded_read(cache/'CACHEDIR.TAG').startswith(b'Signature: 8a477f597d28d172789f06886806bc55'):continue
+            if bounded_read(cache/'.gitignore').decode('utf-8').replace('\r\n','\n')!='# Created by pytest automatically.\n*\n':continue
+            data=json.loads(bounded_read(p).decode('utf-8'))
+            valid=(isinstance(data,list) and all(isinstance(value,str) for value in data)) if p.name=='nodeids' else (
+                isinstance(data,dict) and all(isinstance(k,str) and isinstance(v,bool) for k,v in data.items()))
+            if valid:add(p,cache.parent,'pytest 生成的测试节点/失败记录；移除后会失去上次测试选择信息。',
+                         'pytest 缓存目录标记、自动生成 ignore 标记及 JSON 格式均已核对','test_output')
+        except (OSError,SafetyError,ValueError,UnicodeError):continue
+    for name in result.get('java_paths',[])[:500]:
+        if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消')
+        p=Path(name)
+        output=next((parent for parent in p.parents if parent.name in ('classes','test-classes') and parent.parent.name=='target'),None)
+        if output is None:continue
+        scope=output.parent.parent
+        relative=p.relative_to(output)
+        source=scope/'src'/('main' if output.name=='classes' else 'test')/'java'/relative.parent/(p.stem.split('$')[0]+'.java')
+        try:
+            no_links(p);no_links(source);no_links(scope/'pom.xml')
+            if not source.is_file() or not (scope/'pom.xml').is_file():continue
+            if getattr(p.stat(),'st_file_attributes',0)&(CLOUD_FLAGS|0x400):continue
+            with p.open('rb') as stream:header=stream.read(10)
+            if len(header)!=10 or header[:4]!=b'\xca\xfe\xba\xbe':continue
+            minor,major,pool=struct.unpack('>HHH',header[4:10])
+            if minor not in (0,65535) or not 52<=major<=69 or pool<1:continue
+            add(p,scope,'Maven 标准输出位置中的 Java 编译缓存；对应源码仍存在。需要运行或交付时请保留。',
+                '已核对 class 格式（Java 8–25）、pom.xml 与对应源码位置：'+str(source),'bytecode_cache')
         except (OSError,SafetyError):continue
     for name in result.get('package_scripts',[])[:20]:
         if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消')
@@ -309,7 +345,7 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
         try:
             no_links(script)
             if script.stat().st_size>256*1024:continue
-            code=script.read_text(encoding='utf-8-sig');tree=ast.parse(code)
+            code=bounded_read(script,256*1024).decode('utf-8-sig');tree=ast.parse(code)
             if not any(isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='root' for t in n.targets)
                        and ast.unparse(n.value)=='Path(__file__).resolve().parents[1]' for n in tree.body):continue
             names=set()
@@ -321,10 +357,11 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
             if not names or not excluded:continue
             producers=[]
             src=scope/'src'
+            no_links(src)
             if src.is_dir():
                 for file in list(src.glob('*.cs'))[:40]:
                     no_links(file)
-                    if file.stat().st_size<=512*1024:producers.append((file,file.read_text(encoding='utf-8-sig')))
+                    if file.stat().st_size<=512*1024:producers.append((file,bounded_read(file).decode('utf-8-sig')))
             for output in names:
                 if Path(output).name!=output or Path(output).suffix not in ('.txt','.log'):continue
                 p=script.parent/output
@@ -340,11 +377,13 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
                     add(p,scope,'项目自检生成的结果文件；打包脚本明确将其排除，不是正式运行资源。',
                         '生成代码：'+str(writer)+'；发布排除清单：'+str(script))
             if progress:progress('核对项目生成文件与发布清单',files=len(found))
-        except (OSError,SafetyError,SyntaxError,ValueError):continue
+        except (OSError,SafetyError,SyntaxError,ValueError,UnicodeError):continue
     # A current, explicitly retained package is the comparison anchor, not mtime/name.
     import zipfile
     def package_identity(path):
         no_links(path)
+        if getattr(path.stat(),'st_file_attributes',0)&(CLOUD_FLAGS|0x400):return None
+        if path.stat().st_size>32*1024**2 or time.monotonic()-evidence_started>5:return None
         with zipfile.ZipFile(path) as archive:
             if len(archive.infolist())>2000:return None
             for member in archive.infolist():
@@ -358,7 +397,7 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
         try:
             identity=package_identity(current)
             if not identity:continue
-            for name in result.get('package_paths',[]):
+            for name in result.get('package_paths',[])[:500]:
                 old=Path(name)
                 if old==current or old.parent!=current.parent:continue
                 if package_identity(old)==identity:

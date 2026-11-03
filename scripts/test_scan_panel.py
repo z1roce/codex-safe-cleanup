@@ -99,9 +99,14 @@ class PanelTests(unittest.TestCase):
             with self.assertRaises(HTTPError) as e:self.request('api/inventory-start',True,{},headers)
             self.assertEqual(e.exception.code,403)
 
+    def test_project_filter_rejects_unregistered_paths(self):
+        result=self.operation('inventory-start',{'project':str(self.base)})
+        self.assertEqual(result['state'],'error')
+        self.assertEqual((self.root/'skills/important.txt').read_bytes(),b'keep')
+
     def test_scan_cancellation_preserves_sources_and_releases_lock(self):
         original=self.panel.inventory
-        def slow(scopes=False,progress=None,cancel=None):
+        def slow(scopes=False,progress=None,cancel=None,project=None):
             if scopes:return original(True)
             progress('测试只读扫描')
             if cancel.wait(3):raise inventory.SafetyError('本次扫描已取消')

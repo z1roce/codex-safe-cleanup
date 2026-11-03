@@ -85,6 +85,14 @@ namespace CodexSafeRecycle {
         Result.recycle_path=Operation.Name(created,0x80058000);
         Result.recycle_parsing=Operation.Name(created,0x80028000);
         Result.ok=Result.recycle_path.IndexOf("\\$Recycle.Bin\\",StringComparison.OrdinalIgnoreCase)>=0;
+        string receipt=Environment.GetEnvironmentVariable("CODEX_RECYCLE_RECEIPT");
+        if(Result.ok&&!String.IsNullOrEmpty(receipt)){
+          // Persist the Shell callback before returning to the Python coordinator.
+          byte[] bytes=System.Text.Encoding.UTF8.GetBytes(Result.recycle_path+"\n"+Result.recycle_parsing+"\n");
+          using(var stream=new FileStream(receipt,FileMode.CreateNew,FileAccess.Write,FileShare.Read,4096,FileOptions.WriteThrough)){
+            stream.Write(bytes,0,bytes.Length);stream.Flush(true);
+          }
+        }
       }
       return 0;
     }

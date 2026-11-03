@@ -690,20 +690,16 @@ class Cleaner:
                 if within(dest, self.state / 'quarantine'):
                     raise SafetyError('不能恢复到隔离区内部')
             else:
-                if not self.source_allowed(original, c):
-                    raise SafetyError('原路径已不在范围中，使用 --destination 恢复到另外的空目录')
                 dest = original
             no_links(dest)
-            if is_sync(dest, c['sync_roots']):
-                raise SafetyError('拒绝写入同步目录；用 --destination 选择非同步恢复目录')
             if dest.exists():
                 raise SafetyError('恢复目标已有文件，绝不覆盖：' + str(dest))
             stage = no_links(batch / (e['id'] + '.stage'))
             archive = no_links(batch / (e['id'] + '.zip'))
             dest.parent.mkdir(parents=True, exist_ok=True)
             if stage.exists():
-                # Preserve the actual staged version even after a concurrent edit.
-                snapshot(stage)
+                if not same(snapshot(stage), e['snapshot']):
+                    raise SafetyError('暂存内容或身份改变，请人工核对')
                 if stage.stat().st_dev != dest.parent.stat().st_dev:
                     raise SafetyError('暂存文件必须恢复到同一卷')
                 os.rename(stage, dest)

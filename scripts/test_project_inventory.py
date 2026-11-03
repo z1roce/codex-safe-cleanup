@@ -62,7 +62,8 @@ class ProjectInventoryTests(unittest.TestCase):
   import importlib.util,struct,zipfile
   project=self.base/'generated-project';tools=project/'tools';src=project/'src';tools.mkdir(parents=True);src.mkdir()
   source=tools/'helper.py';source.write_text('print("source fixture")',encoding='utf-8')
-  cache=tools/'__pycache__/helper.cpython-312.pyc';cache.parent.mkdir();s=source.stat()
+  import sys
+  cache=tools/('__pycache__/helper.'+sys.implementation.cache_tag+'.pyc');cache.parent.mkdir();s=source.stat()
   cache.write_bytes(importlib.util.MAGIC_NUMBER+struct.pack('<III',0,int(s.st_mtime),s.st_size)+b'disposable cache fixture')
   script=tools/'package_release.py'
   script.write_text("from pathlib import Path\nroot=Path(__file__).resolve().parents[1]\ntest_output_names={'self-test.txt','input.png'}\nfor path in []:\n if path.name in test_output_names: continue\n",encoding='utf-8')

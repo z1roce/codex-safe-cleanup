@@ -62,7 +62,7 @@ class FileCleanup:
                 if progress:progress('校验所选缓存',files=len(entries))
             plan={'id':key(),'created':utc_stamp(),'expires':time.time()+1200,'status':'preview','entries':entries}
             write_json(self.plans/(plan['id']+'.json'),plan)
-            return {'id':plan['id'],'items':[{k:x[k] for k in ('name','path','purpose','impact','bytes','task_id','sync_risk')} for x in entries],
+            return {'id':plan['id'],'ids':ids,'items':[{k:x[k] for k in ('name','path','purpose','impact','bytes','task_id','sync_risk')} for x in entries],
                     'sync_count':sum(x['sync_risk'] for x in entries),
                     'bytes':total,'note':'仅预览，尚未移动。勾选同意并确认后才进入回收站。'}
 
@@ -79,18 +79,33 @@ class FileCleanup:
             for e in plan['entries']:
                 p=self.check(e['path'],allow_sync=sync_ack==SYNC_ACK)
                 if not same(snapshot(p,max_bytes=MAX_FILE),e['snapshot']):raise SafetyError('内容已改变，未开始清理')
-                if p.stat().st_dev!=self.state.stat().st_dev:raise SafetyError('暂存和源文件必须同卷，保留文件')
             batch=self.records/key();batch.mkdir(parents=True,exist_ok=False)
-            m={'id':batch.name,'created':utc_stamp(),'entries':[],'confirmation':ack}
+            m={'id':batch.name,'created':utc_stamp(),'entries':[],'confirmation':ack,'version':2,
+               'plan_id':pid,'selected_count':len(plan['entries']),
+               'selection':[{'original':old['path'],'name':old['name'],'snapshot':old['snapshot']} for old in plan['entries']]}
             plan['status']='used';write_json(self.plans/(pid+'.json'),plan)
             self.save(batch,m)
             for old in plan['entries']:
-                p=self.check(old['path'],allow_sync=sync_ack==SYNC_ACK);e={'id':key(),'original':str(p),'name':old['name'],
+                p=absolute(old['path']);e={'id':key(),'original':str(p),'name':old['name'],
                     'snapshot':old['snapshot'],'status':'prepared'}
                 m['entries'].append(e);self.save(batch,m)
-                stage=batch/e['id']/p.name;stage.parent.mkdir()
-                e['stage']=str(stage);self.save(batch,m)
                 try:
+                    # Reuse central staging on its volume. Other volumes use the verified
+                    # project/data root, keeping Shell paths shorter than deep source paths.
+                    if p.stat().st_dev==self.state.stat().st_dev:
+                        stage=batch/e['id']/p.name
+                    else:
+                        scope=old.get('scope_root') or next((str(root) for root in inventory.roots() if within(p,root)),None)
+                        if not scope:raise SafetyError('无法确认源卷暂存范围，保留文件')
+                        stage_root=no_links(absolute(scope))
+                        if not within(p,stage_root):raise SafetyError('无效源卷暂存范围')
+                        e['stage_root']=str(stage_root)
+                        stage=stage_root/'.codex-cleanup-staging'/batch.name/e['id']/p.name
+                    e['stage']=str(stage);self.save(batch,m)
+                    p=self.check(p,allow_sync=sync_ack==SYNC_ACK)
+                    no_links(stage);stage.parent.mkdir(parents=True,exist_ok=False)
+                    if p.stat().st_dev!=stage.parent.stat().st_dev:
+                        raise SafetyError('无法建立同卷暂存区，保留源文件')
                     with NativeLease(p) as lease:
                         with lease.reader() as f:
                             if not same(snapshot(p,f,max_bytes=MAX_FILE),e['snapshot']):raise SafetyError('文件变化，保留')
@@ -98,7 +113,9 @@ class FileCleanup:
                         e['status']='staged';self.save(batch,m)
                         with lease.reader() as f:
                             if not same(snapshot(stage,f,max_bytes=MAX_FILE),e['snapshot']):raise SafetyError('暂存校验未通过，请恢复')
-                    result=windows_recycle.native_operation('recycle',stage,e['snapshot']['ino'])
+                    e['status']='recycling';self.save(batch,m)
+                    result=windows_recycle.native_operation('recycle',stage,e['snapshot']['ino'],
+                        receipt=batch/(e['id']+'.receipt'))
                     e['recycle_result']=result;self.save(batch,m)
                     if not result.get('ok'):raise SafetyError('Windows 未确认进入回收站；不执行永久删除，请查看恢复记录')
                     e['status']='recycled';self.save(batch,m)
@@ -115,34 +132,70 @@ class FileCleanup:
     def restore(self,bid,progress=None):
         with self.cleaner.locked():
             folder,m=self.get(bid)
+            if m.get('id')!=bid or m.get('confirmation')!=ACK or m.get('version') not in (None,2):raise SafetyError('不是支持的已确认操作记录')
             for e in m['entries']:
-                if e['status'] not in ('recycled','staged','prepared'):continue
+                if not re.fullmatch('[0-9a-f]{32}',e['id']):raise SafetyError('损坏的文件记录')
+                if m.get('selection') and not any(row['original']==e['original'] and same(row['snapshot'],e['snapshot']) for row in m['selection']):
+                    raise SafetyError('恢复记录与原始确认清单不符')
+                if e['status'] not in ('recycled','staged','prepared','recycling','restoring'):continue
                 if e['status']=='prepared' and not Path(e.get('stage','')).is_file():continue
-                dest=self.check(e['original'],exists=False,allow_sync=True)
+                # Recovery uses the recorded identity and content, independent of current
+                # discovery, Git state, keep markers or cleanup authorization.
+                dest=no_links(absolute(e['original']))
+                if dest==Path(dest.anchor):raise SafetyError('无效恢复目标')
+                if e['status']=='restoring' and dest.is_file() and same(snapshot(dest,max_bytes=MAX_FILE),e['snapshot']):
+                    e['status']='restored';self.save(folder,m);continue
                 if dest.exists():raise SafetyError('原位置已有同名内容，不覆盖')
                 r=e.get('recycle_result',{})
+                receipt=folder/(e['id']+'.receipt')
+                if not r.get('ok') and receipt.exists():
+                    try:
+                        r=windows_recycle.read_receipt(receipt)
+                        e['recycle_result']=r
+                    except (OSError,UnicodeError,SafetyError) as error:
+                        e['receipt_error']=str(error)
+                    self.save(folder,m)
+                stage=no_links(absolute(e['stage']))
+                stage_root=no_links(absolute(e.get('stage_root',str(dest.parent))))
+                if not within(dest,stage_root):raise SafetyError('损坏的暂存范围')
+                expected=stage_root/'.codex-cleanup-staging'/bid/e['id']/dest.name
+                legacy=folder/e['id']/dest.name
+                if stage not in (expected,legacy):raise SafetyError('损坏的暂存路径')
+                if stage.is_file():r={}  # Also handles a manual Shell restore to staging.
+                elif not r.get('ok') and e['status'] in ('recycling','restoring'):
+                    r=windows_recycle.locate_recycled(stage)
+                    e['recycle_result']=r;self.save(folder,m)
                 if r.get('ok'):
                     source=no_links(absolute(r['recycle_path']))
-                else:
-                    source=no_links(absolute(e['stage']))
-                    if not within(source,folder):raise SafetyError('损坏的暂存路径')
-                if not same(snapshot(source,max_bytes=MAX_FILE),e['snapshot']):raise SafetyError('恢复内容已改变，请人工核对')
-                dest.parent.mkdir(parents=True,exist_ok=True)
-                if r.get('ok'):
-                    result=windows_recycle.restore(r,dest,e['snapshot']['ino'])
-                    e['restore_result']=result;self.save(folder,m)
-                    if not result.get('ok'):raise SafetyError('Windows 未确认恢复结果，请核对记录')
-                else:os.rename(source,dest)
-                if not same(snapshot(dest,max_bytes=MAX_FILE),e['snapshot']):raise SafetyError('恢复校验不一致，保留现状')
+                else:source=stage
+                with NativeLease(source) as lease:
+                    with lease.reader() as stream:
+                        if not same(snapshot(source,stream,max_bytes=MAX_FILE),e['snapshot']):
+                            raise SafetyError('恢复内容或身份已改变，请人工核对')
+                    no_links(dest)
+                    dest.parent.mkdir(parents=True,exist_ok=True)
+                    e['status']='restoring';self.save(folder,m)
+                    if r.get('ok'):
+                        result=windows_recycle.restore(r,dest,e['snapshot']['ino'])
+                        e['restore_result']=result;self.save(folder,m)
+                        if not result.get('ok'):raise SafetyError('Windows 未确认恢复结果，请核对记录')
+                    else:os.rename(source,dest)
+                    with lease.reader() as stream:
+                        if not same(snapshot(dest,stream,max_bytes=MAX_FILE),e['snapshot']):
+                            raise SafetyError('恢复校验不一致，保留现状')
                 e['status']='restored';self.save(folder,m)
             return self.view(m)
 
     def view(self,m):
         return {'id':m['id'],'created':m['created'],'kind':'files',
                 'entries':[{'name':e['name'],'original':e['original'],'bytes':e['snapshot']['size'],
-                            'status':e['status'],'error':e.get('error')} for e in m['entries']],
-                'failed':any(e.get('error') for e in m['entries']),
-                'recoverable':any(e['status'] in ('recycled','staged') or (e['status']=='prepared' and Path(e.get('stage','')).is_file()) for e in m['entries'])}
+                            'status':e['status'],'error':e.get('error'),
+                            'recoverable':e['status'] in ('recycled','staged','recycling','restoring') or (e['status']=='prepared' and Path(e.get('stage','')).is_file())} for e in m['entries']],
+                'selected_count':m.get('selected_count',len(m['entries'])),
+                'unprocessed_count':m.get('selected_count',len(m['entries']))-len(m['entries']),
+                'unprocessed':[{'name':row['name'],'original':row['original']} for row in m.get('selection',[]) if row['original'] not in {e['original'] for e in m['entries']}],
+                'failed':any(e.get('error') and e['status']!='restored' for e in m['entries']),
+                'recoverable':any(e['status'] in ('recycled','staged','recycling','restoring') or (e['status']=='prepared' and Path(e.get('stage','')).is_file()) for e in m['entries'])}
 
     def history(self):
         return [self.view(read_json(p)) for p in sorted(self.records.glob('*/manifest.json'),key=lambda p:p.stat().st_mtime,reverse=True)][:30]

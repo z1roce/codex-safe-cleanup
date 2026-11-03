@@ -11,6 +11,17 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
   page.on('pageerror',e=>errors.push(e.message));
   await page.goto(process.env.PANEL_TEST_URL);
   await page.waitForFunction(()=>document.querySelector('#job').textContent.includes('已就绪'));
+  // Batch planning uses synthetic rows and issues no cleanup request.
+  assert.deepEqual(await page.evaluate(()=>{
+   const original=window.currentCandidates;
+   window.currentCandidates=Array.from({length:105},(_,i)=>({id:String(i),bytes:1024,selectable:true}));
+   for(const row of window.currentCandidates)selected.add(row.id);
+   const first=nextBatch();
+   for(const id of first)selected.delete(id);
+   const second=nextBatch();
+   selected.clear();window.currentCandidates=original;
+   return [first.length,second.length];
+  }),[100,5]);
   for(const viewport of [{width:319,height:690},{width:768,height:600},{width:1280,height:800}]){
    await page.setViewportSize(viewport);
    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
@@ -61,6 +72,10 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
   await page.locator('#history [data-record-kind="legacy"]').getByRole('button',{name:'查看恢复清单',exact:true}).click();
   await page.locator('#consent').check();await page.locator('#restore-confirm').click();
   await page.waitForFunction(()=>document.querySelector('#job').textContent.includes('恢复操作结束'));
+  await page.locator('#project-filter').selectOption({index:1});
+  await page.locator('#scan').click();
+  await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('检查完成'));
+  assert.equal(await page.locator('#project-coverage > .item').count(),1);
   assert.deepEqual(errors,[]);
   console.log('Passed responsive 319/768/1280 widths, repeat Codex-only scans, no cleanup, explicit recovery');
  }finally{await browser.close();}

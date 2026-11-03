@@ -37,6 +37,7 @@ class Panel:
         self.jobs = {}
         self.jobs_lock = threading.Lock()
         self.scan_cancellations = {}
+        self.capabilities=None
 
     def launch_job(self, function, kind='operation', cancel=None):
         if not self.scan_lock.acquire(blocking=False):
@@ -77,6 +78,11 @@ class Panel:
         return self.launch_job(run, 'preview', cancel)
 
     def bootstrap(self):
+        if self.capabilities is None:
+            from diagnostics import diagnose
+            self.capabilities=diagnose(self.state)
+        from project_discovery import discover
+        project_scopes,project_omissions=discover(inventory.context(self.state),inventory.roots())
         paths = list((self.state / 'codex-reports').glob('*.json'))
         latest=None
         expected_signature=inventory.metadata_signature(self.state)
@@ -91,7 +97,8 @@ class Panel:
         with self.jobs_lock:
             active = next((jid for jid, j in self.jobs.items() if j['state'] == 'running'), None)
         return {'latest':latest, 'active_job':active, 'candidates':latest.get('candidates',[]) if latest else [], 'cleanup_enabled':True, 'history':self.file_cleanup.history()+[dict(x,kind='legacy') for x in self.cleanup.history()],
-                'manual_paused':self.cleanup.paused(), 'roots':[x['path'] for x in self.inventory(scopes=True)['scopes']]}
+                'manual_paused':self.cleanup.paused(), 'roots':[x['path'] for x in self.inventory(scopes=True)['scopes']],
+                'diagnostics':self.capabilities,'projects':project_scopes,'project_omissions':project_omissions}
 
     def run(self, command):
         if command not in ('status', 'scan'):
@@ -107,12 +114,12 @@ class Panel:
             raise RuntimeError(result.stderr.strip() or '扫描未完成，文件继续保留')
         return json.loads(result.stdout)
 
-    def inventory(self, scopes=False, progress=None, cancel=None):
+    def inventory(self, scopes=False, progress=None, cancel=None,project=None):
         if scopes:
             return {'scopes':inventory.discover(self.state)}
         with self.cleaner.locked():
             ctx=inventory.context(self.state)
-            report=inventory.run_inventory(self.state,ctx=ctx,progress=progress,cancel=cancel)
+            report=inventory.run_inventory(self.state,ctx=ctx,progress=progress,cancel=cancel,project=project)
             if report['project_count']!=len(ctx.get('projects',[])) or report['thread_count']!=len(ctx.get('threads',[])):
                 raise SafetyError('项目关联信息没有完整读取，本轮不作为检查成功，请刷新项目索引')
             return report
@@ -163,8 +170,8 @@ class Panel:
                             return self.reply(400, {'error':'无效的操作参数'})
                     if not post and route == '':
                         return self.reply(200, PANEL_HTML.read_text(encoding='utf-8').replace('__NONCE__', panel.token), html=True)
-                    if post and route in ('api/inventory', 'api/inventory-start') and body:
-                        return self.reply(400, {'error':'扫描范围固定为 Codex 数据目录，不能通过网页参数扩展'})
+                    if post and route in ('api/inventory', 'api/inventory-start') and body and (set(body)!={'project'} or not isinstance(body['project'],str)):
+                        return self.reply(400, {'error':'只能检查已发现或登记的项目，不能通过网页参数扩展'})
                     if not post and route == 'api/bootstrap':
                         return self.reply(200, panel.bootstrap())
                     if not post and route.startswith('api/jobs/'):
@@ -193,20 +200,20 @@ class Panel:
                         if not panel.scan_lock.acquire(blocking=False):
                             return self.reply(409, {'error': '已有一次扫描正在进行，请稍候'})
                         try:
-                            return self.reply(200, panel.inventory())
+                            return self.reply(200, panel.inventory(project=body.get('project') if body else None))
                         finally:
                             panel.scan_lock.release()
                     if post and route == 'api/inventory':
                         if not panel.scan_lock.acquire(blocking=False):
                             return self.reply(409, {'error': '已有扫描正在进行，请稍候'})
                         try:
-                            return self.reply(200, panel.inventory())
+                            return self.reply(200, panel.inventory(project=body.get('project') if body else None))
                         finally:
                             panel.scan_lock.release()
                     if post and route == 'api/inventory-start':
                         cancel = threading.Event()
                         return self.reply(200, panel.launch_job(
-                            lambda progress:panel.inventory(progress=progress, cancel=cancel), 'inventory', cancel))
+                            lambda progress:panel.inventory(progress=progress, cancel=cancel,project=body.get('project') if body else None), 'inventory', cancel))
                     if post and route in ('api/inventory-cancel', 'api/cleanup-cancel-preview'):
                         jid = body.get('job')
                         if not isinstance(jid, str):
@@ -313,9 +320,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state', default=str(Path(os.environ['LOCALAPPDATA']) / 'CodexSafeCleanup'))
     p.add_argument('--serve', action='store_true')
+    p.add_argument('--diagnose', action='store_true', help='仅检查启动能力，不启动面板')
     p.add_argument('--open', action='store_true', help='在系统浏览器打开；Codex 内使用 open_in_codex')
     p.add_argument('--idle-minutes', type=int, default=30)
     args = p.parse_args()
+    if not args.serve:
+        from diagnostics import diagnose
+        print(json.dumps({'diagnostics':diagnose(args.state)},ensure_ascii=False))
+    if args.diagnose:return
     if args.serve:
         serve(args.state, args.idle_minutes)
     else:

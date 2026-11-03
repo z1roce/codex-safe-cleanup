@@ -505,18 +505,8 @@ class ReviewedCleanup:
                 if e['status'] not in ('quarantined', 'staged', 'recycled', 'recycle_pending'):
                     continue
                 original = no_links(absolute(e['original']))
-                cfg = self.cleaner.cfg()
-                for value in cfg.get('protect', []):
-                    keep = absolute(value)
-                    if within(original, keep) or within(keep, original):
-                        raise SafetyError('原位置已有新的用户保护规则，暂停恢复，请人工核对')
                 if original.exists():
                     raise SafetyError('原位置已有内容，未覆盖。请让 Codex 帮你选择另一个恢复位置')
-                if is_sync(original, cfg.get('sync_roots', [])):
-                    raise SafetyError('原位置现在属于同步目录，暂停恢复，请选择非同步位置')
-                for parent in original.parents:
-                    if (parent / '.git').exists() or (parent / '.codex-keep').exists():
-                        raise SafetyError('原位置的保护状态已改变，暂停恢复')
                 if e['status'] in ('recycled', 'recycle_pending') and e.get('recycle_result', {}).get('ok'):
                     payload = no_links(absolute(e['recycle_result']['recycle_path']))
                 else:

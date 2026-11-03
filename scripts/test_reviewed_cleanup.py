@@ -42,6 +42,14 @@ class ReviewedTests(unittest.TestCase):
     def preview(self):
         return self.engine.preview([self.iid])
 
+    def test_legacy_restore_survives_index_keep_and_git_changes(self):
+        result=self.engine.execute(self.preview()['id'],rc.ACK)
+        write_json(self.state/'inventory-context.json',{'projects':[],'threads':[]})
+        (self.folder.parent/'.codex-keep').write_text('new protection')
+        (self.folder.parent/'.git').mkdir()
+        rc.ReviewedCleanup(self.state).restore(result['id'])
+        self.assertEqual((self.folder/'tool.bin').read_bytes(),b'test dependency bytes\n'*1000)
+
     def test_native_recycle_and_restore_only_disposable_fixture(self):
         p = self.preview()
         with self.assertRaises(SafetyError):

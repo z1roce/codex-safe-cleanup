@@ -16,19 +16,36 @@ Conservative, preview-first cleanup for Codex on Windows. Exact files only, expl
 
 ## 环境与启动
 
-- Windows；实际开发验证环境为 Windows x64、Python 3.12，部分只读检查也在 Python 3.14 验证。其他系统/架构未验证。
+- Windows；实际开发验证环境为 Windows x64、Python 3.12，本次同时验证 Python 3.14 的完整测试。其他系统/架构未验证。
 - Python **3.12 或更新版本**；主程序只用标准库。回收站通过系统 PowerShell 和 Windows Shell 接口工作，不需要管理员权限。
 - Git 可选；遇到 Git 项目却无法核实跟踪状态时，相关文件继续保护。
 
-下载本仓库 ZIP 并解压，然后双击 `scripts/open-scan-panel.cmd`。启动器先找 Codex 自带 Python，再找 Python 启动器/本机 Python；找不到时安装 Python，或将 `CODEX_CLEANUP_PYTHON` 设为 Python 3.12+ 的完整路径。
+下载本仓库 ZIP 并解压，然后双击 `scripts/open-scan-panel.cmd`。启动器逐个验证 Codex 运行库、Python 启动器、PATH、本机安装目录和 Windows 注册表中的解释器，跳过过旧或无法运行的自动候选，并显示最终路径与版本。找不到时安装 Python，或将 `CODEX_CLEANUP_PYTHON` 设为 Python 3.12+ 的完整路径。
 
 也可以在仓库根目录运行：
 
 ```powershell
-py -3 scripts/scan_panel.py --open
+.\scripts\open-scan-panel.cmd
 ```
 
-如需让 Codex 作为 Skill 使用，把本文件夹复制为 `%USERPROFILE%\.agents\skills\codex-safe-cleanup`，或在允许运行本地脚本的 PowerShell 中执行 `scripts/install.ps1`。安装脚本拒绝覆盖已有同名技能，不改变系统执行策略；无须安装磁盘管理软件。
+如需让 Codex 作为 Skill 使用，把本文件夹复制为 `%USERPROFILE%\.agents\skills\codex-safe-cleanup`，或在允许运行本地脚本的 PowerShell 中执行 `scripts/install.ps1`。首次安装遇到已有目录会停止。升级用 `scripts/install.ps1 -Upgrade`，逐文件核对分发清单与用户修改，保留用户配置和恢复记录。切换失败会回退，中断后可用 `-Recover` 核对事务并恢复旧安装。启动 CMD 仅对本次 PowerShell 进程使用执行策略参数，组策略限制仍由系统执行。
+
+## 启动诊断与手动项目登记
+
+启动时显示 Python、状态目录、回收站桥接、Git 和索引能力，面板中也可展开查看。仅诊断可运行以下命令。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/open-scan-panel.ps1 --diagnose
+```
+
+手动登记只增加检查范围，未知文件仍保留。先用可用 Python 运行下列命令，再在面板“检查范围”中选择项目。
+
+```powershell
+python scripts/inventory.py --register-project "D:\开发项目\示例"
+python scripts/inventory.py --project "D:\开发项目\示例"
+```
+
+这里的 `python` 需要为 Python 3.12+，也可换为启动诊断显示的完整解释器路径。整盘、通用用户文件夹、系统和受保护内部目录拒绝登记。
 
 ## 使用与保护
 
@@ -43,7 +60,7 @@ py -3 scripts/scan_panel.py --open
 
 在新电脑上不会携带作者的项目索引或候选清单。可从本机 Codex 项目路径字段发现部分范围；若需完整历史关联，请在 Codex 中使用本 Skill 刷新项目/聊天索引。不要把自己的索引或聊天资料提交到 GitHub。
 
-每批最多 100 个文件、128 MiB；只校验所选内容。当前暂存区与源文件必须同卷，跨卷文件会拒绝清理；它不会为兼容性而改成永久删除。恢复状态保存在 `%LOCALAPPDATA%\CodexSafeCleanup`。Windows 回收站直接“还原”可能先回到工具暂存区，优先用面板恢复。
+每批最多 100 个文件、128 MiB；只校验所选内容。面板逐批展示精确清单，剩余选择需再次预览确认。与状态目录不同卷的文件在已核实项目根的 `.codex-cleanup-staging` 中同卷暂存，恢复信息仍集中记录。源卷离线或无法建立暂存区时停止并保留记录。恢复状态保存在 `%LOCALAPPDATA%\CodexSafeCleanup`。Windows 回收站直接“还原”可能先回到工具暂存区，优先用面板恢复。
 
 **回收站和隔离区仍占空间，也可能被用户或系统清空。** 本工具不清空回收站，不保证永远可恢复，也不承诺绝对不会误删。
 
@@ -55,7 +72,7 @@ py -3 scripts/scan_panel.py --open
 
 ## 开发与验证
 
-本机已验证 83 个测试场景；23 项只读检查在 Python 3.12/3.14 均通过，远程 CI 结果需以仓库实际运行记录为准。测试和限制见 [CONTRIBUTING.md](CONTRIBUTING.md)，使用细节见 [使用说明](references/使用说明.md)，选型依据见 [调研与边界](references/调研与边界.md)，漏洞反馈见 [SECURITY.md](SECURITY.md)。所有有清理动作的测试只使用专门创建的可丢弃目录。
+本次逐项核实、测试命令与支持限制见 [审查与验证](references/审查与验证.md)。开发测试见 [CONTRIBUTING.md](CONTRIBUTING.md)，操作步骤见 [使用说明](references/使用说明.md)，来源与取舍见 [调研与边界](references/调研与边界.md)。所有移动测试仅使用新建可丢弃夹具。
 
 MIT License。欢迎提供不含私人路径、聊天和凭据的复现步骤；规则宁可漏报，不靠扩大删除范围提高“清理量”。
 

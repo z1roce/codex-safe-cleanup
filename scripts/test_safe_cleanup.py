@@ -21,8 +21,11 @@ class SafetyTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='codex-cleanup-test-',
                                                 dir=os.environ['CLEANUP_TEST_ROOT'])
         self.base = Path(self.temp.name)
-        self.root = self.base / 'candidates'
-        self.root.mkdir()
+        self.codex_env=patch.dict(os.environ,CODEX_HOME=str(self.base/'codex'))
+        self.codex_env.start()
+        self.addCleanup(self.codex_env.stop)
+        self.root = self.base / 'codex/visualizations/candidates'
+        self.root.mkdir(parents=True)
         self.c = sc.Cleaner(self.base / 'state')
         with self.c.locked():
             self.c.init([str(self.root)])
@@ -40,6 +43,13 @@ class SafetyTests(unittest.TestCase):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
         return p
+
+    def test_legacy_restore_survives_scope_change(self):
+        p=self.file('recovery.tmp');self.enable();self.approve(p)
+        result=self.c.apply()
+        cfg=self.c.cfg();cfg['roots']=[];cfg['protect']=[str(p)];self.c.save(cfg)
+        self.c.restore(result['batch'])
+        self.assertEqual(p.read_bytes(),b'disposable log\n'*1000)
 
     def row(self, report, p):
         return next(x for x in report['items'] if x['path'] == str(p))

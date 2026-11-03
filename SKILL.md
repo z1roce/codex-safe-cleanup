@@ -47,3 +47,14 @@ description: Inspect leftovers across all Codex projects, historical task output
 隔离和回收站仍占空间；回收站被清空后可能无法恢复。不要删除工具记录或清空回收站来“关闭”工具。关闭只停止面板和后续调用。旧 ZIP 隔离记录仍可通过原 `history/restore` 命令恢复；公开 CLI 已停用其他旧版清理模式，不要修改 Codex 内部数据库。
 
 只报告实际检查和测试，不承诺绝对不会误删。Windows 本机已测试；不要把 Python 标准库实现描述为其他平台已经验证。调研取舍见 [调研与边界](references/调研与边界.md)。
+
+
+## Windows 可移植性与升级
+
+启动入口共用 `python-launcher.ps1`，逐个验证候选解释器，显式 `CODEX_CLEANUP_PYTHON` 无效时明确报错。启动时及面板内展示能力诊断。安装使用分发清单，包含 LICENSE。升级使用 `install.ps1 -Upgrade`，检测用户修改并保留原安装与外部状态，安装中断使用 `-Recover`，保留备份供核对。
+
+项目发现集中在 `project_discovery.py`，读取失败、未知字段和范围遗漏在报告中展示。`inventory.py --register-project` 仅登记具体目录的只读范围，不能代替产物来源证据和逐批确认。面板支持按已发现项目检查，每批最多100文件、128MiB，剩余选择必须再次预览确认。
+
+不同源卷使用已核实项目根中的 `.codex-cleanup-staging`，状态目录集中保存每步记录。暂存目录受扫描保护。离线、权限不足、部分成功和中断时保留记录，优先恢复已移动文件。恢复依据已确认操作记录、保存文件身份和完整内容哈希，不依赖当前项目索引、Git 状态或保留标记，仍检查链接、路径安全和同名冲突。原生回收凭据与精确暂存路径的回收站元数据用于中断核对，不能把其他回收站内容混入恢复。
+
+缓存识别支持 CPython 3.12–3.14 的稳定版格式，未知版本和解释器继续保留。pytest 默认缓存需要生成标记与 JSON 格式证据，Maven Java 编译缓存需要标准输出位置、对应源码、pom.xml 和 class 文件头。识别结果继续经过所有文件保护和用户确认。详细核实与实际验证见 `references/审查与验证.md`。

@@ -16,7 +16,7 @@ from types import SimpleNamespace
 sys.dont_write_bytecode = True
 from safe_cleanup import Cleaner, SafetyError, absolute, no_links, write_json, read_json, within, is_sync, PROTECTED_SUFFIXES, PROTECTED_NAMES, digest
 
-SCOPE_VERSION = 6
+SCOPE_VERSION = 7
 MAX_FILES = 20000
 MAX_SECONDS = 10
 BLOCK_FLAGS = 0x400 | 0x1000 | 0x40000 | 0x400000
@@ -90,7 +90,14 @@ def artifact_entries(state):
 
 def metadata_signature(state,ctx=None):
     file=Path(state)/'artifact-registry.json'
+    indexes=[]
+    for root in roots():
+        path=root/'.codex-global-state.json'
+        try:
+            info=no_links(path).stat();indexes.append([str(path),info.st_ino,info.st_size,info.st_mtime_ns])
+        except (OSError,SafetyError):indexes.append([str(path),'unavailable'])
     return digest({'context':context(state) if ctx is None else ctx,
+                   'local_indexes':indexes,
                    'manual_artifacts':read_json(file) if file.exists() else {}})
 
 
@@ -148,8 +155,8 @@ def roots():
 
 
 def context(state):
-    file=Path(state)/'inventory-context.json'
-    return read_json(file) if file.exists() else {'projects':[],'threads':[]}
+    from project_discovery import context as load_context
+    return load_context(state)
 
 
 def discover(state=None, ctx=None, extra=()):
@@ -160,13 +167,13 @@ def discover(state=None, ctx=None, extra=()):
                                        else 'CODEX_HOME 明确配置的 Codex 目录']} for p in allowed]
 
 
-def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=None):
+def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=None,project=None):
     state = Cleaner(state).state
     expected = discover(state, extra=extra)
     allowed = [Path(s['path']) for s in expected]
     if scopes is not None and any(absolute(x['path']) not in allowed for x in scopes):
         raise SafetyError('扫描范围必须是核实过的 Codex 数据根；拒绝其他目录')
-    scopes = expected if scopes is None else scopes
+    scopes = ([] if project else expected) if scopes is None else scopes
     started = time.perf_counter()
     items, skipped, coverage, candidates = [], [], [], []
     total_files = 0
@@ -287,7 +294,7 @@ def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=
     items.sort(key=lambda x:(x['status']!='review', -(x['bytes'] or 0)))
     import project_inventory
     ctx=context(state) if ctx is None else ctx
-    projects=project_inventory.scan_projects(state,ctx,roots(),progress,cancel)
+    projects=project_inventory.scan_projects(state,ctx,roots(),progress,cancel,project)
     generated=project_inventory.discover_generated(projects,progress,cancel,artifact_entries(state))
     discovery_file=state/'discovery-index.json'
     remembered=read_json(discovery_file).get('artifacts',[]) if discovery_file.exists() else []
@@ -296,12 +303,14 @@ def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=
     if discovered:write_json(discovery_file,{'version':1,'artifacts':list(discovered.values())})
     artifacts=[]
     for entry in artifact_entries(state):
+        if project and not within(absolute(entry['path']),absolute(project)):continue
         try:
             row=inspect_artifact(entry,state=state)
             artifacts.append(row)
             if row['selectable']:candidates.append(row)
         except (OSError,SafetyError,ValueError) as e:
             skipped.append({'path':entry.get('path','未登记路径'),'reason':str(e)})
+    complete=complete and projects['complete'] and not projects.get('evidence_limits')
     report = {'mode':'inventory_only', 'scope_version':SCOPE_VERSION, 'id':uuid.uuid4().hex,
               'created':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()), 'complete':complete,
               'elapsed_seconds':round(time.perf_counter()-started,4), 'coverage':coverage, 'skipped':skipped,
@@ -310,6 +319,9 @@ def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=
               'eligible':0, 'candidates':candidates, 'duplicate_groups':[], 'hash_bytes':0, 'review_summary':[],
               'project_items':projects['items'],'project_coverage':projects['coverage'],
               'project_complete':projects['complete'],'project_file_count':projects['file_count'],
+              'selected_project':project,'project_scope_omissions':projects['scope_omissions'],
+              'project_skipped':projects['skipped'],
+              'evidence_limits':projects.get('evidence_limits',[]),
               'project_index_captured_at':ctx.get('captured_at'),'project_count':len(ctx.get('projects',[])),
               'thread_count':len(ctx.get('threads',[])),'task_artifacts':artifacts,
               'metadata_signature':metadata_signature(state,ctx),'record_state':str(state),
@@ -342,13 +354,20 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state', default=str(Path(os.environ.get('LOCALAPPDATA',str(Path.home())))/'CodexSafeCleanup'))
     p.add_argument('--scopes', action='store_true')
+    p.add_argument('--project', help='只检查已发现项目的完整路径')
+    p.add_argument('--register-project', help='手动登记具体项目，仅授予只读范围')
     a = p.parse_args()
     c = Cleaner(a.state)
-    if a.scopes:
-        result = {'scopes':discover(c.state)}
+    if a.register_project:
+        from project_discovery import register
+        with c.locked():result=register(c.state,a.register_project,roots())
+    elif a.scopes:
+        from project_discovery import discover as discover_projects
+        projects,omitted=discover_projects(context(c.state),roots())
+        result = {'scopes':discover(c.state),'projects':projects,'omissions':omitted}
     else:
         with c.locked():
-            result = run_inventory(c.state)
+            result = run_inventory(c.state,project=a.project)
     print(json.dumps(result,ensure_ascii=False))
 
 

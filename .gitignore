@@ -2,6 +2,14 @@
 inventory-context*.json
 artifact-registry*.json
 discovery-index*.json
+manual-projects*.json
+installation-manifest.json
+*.install-transaction.json
+*.install-lock
+*.install-stage-*/
+*.install-backup-*/
+.codex-cleanup-staging/
+*.receipt
 config.json
 panel.json
 panel-controls.json
