@@ -59,6 +59,25 @@ class DiscoveryRuleTests(unittest.TestCase):
         self.assertFalse(report['project_complete'])
         self.assertIn('not_scanned_limit',[row['status'] for row in report['project_coverage']])
 
+    def test_deep_scan_keeps_scope_and_explicit_resource_budget(self):
+        ctx={'projects':[{'path':str(self.project)}],'threads':[]}
+        with self.assertRaises(SafetyError):inventory.run_inventory(self.state,ctx,deep=True)
+        report=inventory.run_inventory(self.state,ctx,project=str(self.project),deep=True)
+        self.assertEqual(report['scan_limits'],{'files':1000000,'seconds':180})
+        self.assertEqual([row['path'] for row in report['project_coverage']],[str(self.project)])
+
+    def test_explicit_relocation_updates_only_readonly_association(self):
+        discovery.register(self.state,str(self.project),[self.codex])
+        file=self.project/'original.txt';file.write_bytes(b'preserve original')
+        moved=self.base/'移动后的项目'
+        self.project.rename(moved)
+        discovery.register(self.state,str(moved),[self.codex],str(self.project))
+        scopes,_=discovery.discover(discovery.context(self.state),[self.codex])
+        self.assertIn(str(moved),[row['path'] for row in scopes])
+        self.assertNotIn(str(self.project),[row['path'] for row in scopes])
+        self.assertEqual((moved/'original.txt').read_bytes(),b'preserve original')
+        self.assertEqual(inventory.run_inventory(self.state)['candidates'],[])
+
     def test_python_stable_version_headers_and_unknown_versions(self):
         source=self.project/'helper.py';source.write_text('value=1\n',encoding='utf-8')
         folder=self.project/'__pycache__';folder.mkdir()

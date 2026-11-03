@@ -110,7 +110,7 @@ class PanelTests(unittest.TestCase):
 
     def test_scan_cancellation_preserves_sources_and_releases_lock(self):
         original=self.panel.inventory
-        def slow(scopes=False,progress=None,cancel=None,project=None):
+        def slow(scopes=False,progress=None,cancel=None,project=None,deep=False):
             if scopes:return original(True)
             progress('测试只读扫描')
             if cancel.wait(3):raise inventory.SafetyError('本次扫描已取消')
@@ -168,6 +168,30 @@ class PanelTests(unittest.TestCase):
         self.assertEqual((folder/'tool.bin').read_bytes(),b'only disposable fixture')
         self.assertEqual((self.root/'skills/important.txt').read_bytes(),b'keep')
         self.assertEqual((cache/'shell-apps.json').read_bytes(),b'only disposable app catalog')
+
+    @unittest.skipUnless(os.environ.get('CLEANUP_BULK_BROWSER_TEST')=='1','Explicit 105-file native browser integration')
+    def test_bulk_browser_partial_failure_resume_and_restore(self):
+        import uuid
+        import windows_recycle
+        files=[]
+        for index in range(1,106):
+            file=self.root/'cache/computer-use/computer-use-app-catalog'/str(uuid.UUID(int=index))/'shell-apps.json'
+            file.parent.mkdir(parents=True);file.write_bytes(b'disposable browser bulk fixture');files.append(file)
+        native=windows_recycle.native_operation;calls=0
+        def fail_second(mode,*args,**kwargs):
+            nonlocal calls
+            if mode=='recycle':
+                calls+=1
+                if calls==2:return {'ok':False,'error':'synthetic second-file bridge refusal'}
+            return native(mode,*args,**kwargs)
+        bundled=Path.home()/'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe'
+        node=os.environ.get('CLEANUP_NODE') or (str(bundled) if bundled.is_file() else shutil.which('node'))
+        self.assertTrue(node,'Browser tests require Node.js; set CLEANUP_NODE if it is not on PATH')
+        with patch('windows_recycle.native_operation',side_effect=fail_second):
+            result=subprocess.run([str(node),str(Path(__file__).with_name('test_panel_ui.cjs'))],
+                env=dict(os.environ,PANEL_TEST_URL=self.url,PANEL_TEST_BULK='1'),capture_output=True,text=True,encoding='utf-8',timeout=420)
+        self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr)
+        self.assertTrue(all(file.read_bytes()==b'disposable browser bulk fixture' for file in files))
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

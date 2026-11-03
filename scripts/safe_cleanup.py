@@ -130,10 +130,18 @@ def write_json(path, value):
     os.replace(temp, path)
 
 
-def hash_stream(f):
+def hash_stream(f, progress=None, deadline=None):
     h = hashlib.sha256()
+    processed=0
+    reported=time.monotonic()
     while block := f.read(1024 * 1024):
         h.update(block)
+        processed+=len(block)
+        now=time.monotonic()
+        if deadline is not None and now>deadline:raise SafetyError('流式校验超过时间预算，保留文件')
+        if progress and now-reported>=.2:
+            progress(processed);reported=now
+    if progress:progress(processed)
     return h.hexdigest()
 
 
@@ -212,7 +220,7 @@ def dispose_locked(f):
         raise SafetyError('隔离副本无法安全移除，ZIP 与暂存文件均保留')
 
 
-def snapshot(p, source=None, max_bytes=None):
+def snapshot(p, source=None, max_bytes=None, progress=None, deadline=None):
     no_links(p)
     before = p.stat()
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -226,13 +234,13 @@ def snapshot(p, source=None, max_bytes=None):
         raise SafetyError('超过单文件校验上限，保留并人工检查')
     if source is None:
         with p.open('rb') as f:
-            h = hash_stream(f)
+            h = hash_stream(f,progress,deadline)
     else:
         identity = os.fstat(source.fileno())
         if (identity.st_ino, identity.st_dev) != (before.st_ino, before.st_dev):
             raise SafetyError('路径不再指向已锁定的文件')
         source.seek(0)
-        h = hash_stream(source)
+        h = hash_stream(source,progress,deadline)
     after = p.stat()
     fields = ('st_size', 'st_mtime_ns', 'st_ino', 'st_dev')
     if any(getattr(before, x) != getattr(after, x) for x in fields):

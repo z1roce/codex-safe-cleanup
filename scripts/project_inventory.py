@@ -44,14 +44,17 @@ def group_path(p, root):
     return root.joinpath(*parts[:min(2, len(parts))]) if parts else root
 
 
-def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
+def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
     state = Cleaner(state).state
+    file_limit=MAX_FILES*5 if deep else MAX_FILES
+    seconds_limit=MAX_SECONDS*6 if deep else MAX_SECONDS
     ctx = ctx or context(state)
     scopes = scopes or []
     started = time.monotonic()
     groups, files, coverage = {}, [], []
     bytecode_paths, package_scripts, package_paths = [], [], []
     pytest_paths,java_paths=[],[]
+    rule_inputs=[]
     skipped = []
     count = 0
     budget_hit = False
@@ -84,13 +87,13 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
             cover['status'] = 'partial'
             problem(getattr(e, 'filename', root), '无法读取：' + str(e))
         for base, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
-            if time.monotonic()-started>=MAX_SECONDS:
-                budget_hit=True;cover['status']='partial_limit';break
+            if time.monotonic()-started>=seconds_limit:
+                budget_hit=True;cover.update(status='partial_limit',stopped_at=str(base));break
             if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消；未清理文件')
             base = Path(base)
             safe_dirs = []
             for name in dirs:
-                if time.monotonic()-started>=MAX_SECONDS:
+                if time.monotonic()-started>=seconds_limit:
                     budget_hit=True;cover['status']='partial_limit';break
                 p = base / name
                 try:
@@ -107,11 +110,11 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
                     cover['status'] = 'partial'
                     problem(p, str(e))
             dirs[:] = safe_dirs
-            for name in names:
+            for index,name in enumerate(names):
                 if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消；未清理文件')
-                if count >= MAX_FILES or time.monotonic() - started >= MAX_SECONDS:
+                if count >= file_limit or time.monotonic() - started >= seconds_limit:
                     budget_hit = True
-                    cover['status'] = 'partial_limit'
+                    cover.update(status='partial_limit',stopped_at=str(base/name),unscanned_current_directory_files=len(names)-index)
                     break
                 p = base / name
                 try:
@@ -130,6 +133,8 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
                     if p.parent.name=='cache' and p.parent.parent.name=='v' and p.parent.parent.parent.name=='.pytest_cache' and p.name in ('nodeids','lastfailed'):
                         pytest_paths.append(str(p))
                     if p.suffix=='.class':java_paths.append(str(p))
+                    if name=='compile_commands.json' or (name.startswith('tsconfig') and p.suffix=='.json') or (name.endswith('.meta.json') and '.mypy_cache' in p.parts):
+                        rule_inputs.append((str(p),str(root)))
                     if p.name=='package_release.py' and p.parent.name=='tools':package_scripts.append(str(p))
                     gp = group_path(p, root)
                     g = groups.setdefault(str(gp), dict(path=str(gp), bytes=0, file_count=0,
@@ -223,14 +228,19 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None):
         if members and any(g['status'] == 'review' for g in members):
             report['review_summary'].append(dict(x, bytes=sum(g['bytes'] for g in members),
                 file_count=sum(g['file_count'] for g in members), decision='用途已说明，是否仍需使用待用户判断；继续保留'))
+    report['scan_profile']='deep' if deep else 'quick'
+    report['scan_limits']={'files':file_limit,'seconds':seconds_limit}
     report['bytecode_paths']=bytecode_paths
     report['package_scripts']=package_scripts
     report['package_paths']=package_paths
     report['pytest_paths']=pytest_paths
     report['java_paths']=java_paths
+    report['rule_inputs']=rule_inputs
+    evidence_limit=5000 if deep else 500
     report['evidence_limits']=[{'kind':kind,'discovered':len(paths),'checked_limit':limit}
-        for kind,paths,limit in [('Python 缓存',bytecode_paths,500),('发布脚本',package_scripts,20),
-                                ('pytest 缓存',pytest_paths,500),('Java 编译缓存',java_paths,500)] if len(paths)>limit]
+        for kind,paths,limit in [('Python 缓存',bytecode_paths,evidence_limit),('发布脚本',package_scripts,20),
+                                ('pytest 缓存',pytest_paths,evidence_limit),('Java 编译缓存',java_paths,evidence_limit),
+                                ('扩展生成规则',rule_inputs,500)] if len(paths)>limit]
     return report
 
 
@@ -239,13 +249,14 @@ def discover_projects(ctx,codex_roots):
     return discover(ctx,codex_roots)
 
 
-def scan_projects(state,ctx,codex_roots,progress=None,cancel=None,project=None):
+def scan_projects(state,ctx,codex_roots,progress=None,cancel=None,project=None,deep=False):
     scopes,omitted=discover_projects(ctx,codex_roots)
     if project is not None:
         scopes=[scope for scope in scopes if absolute(scope['path'])==absolute(project)]
         if not scopes:raise SafetyError('只能按已发现或手动登记的项目检查')
     safe_ctx=dict(ctx,threads=[dict(t,title=t.get('title') or '任务标题未核实') for t in ctx.get('threads',[])])
-    result=_scan(state,safe_ctx,scopes,progress,cancel)
+    if deep and project is None:raise SafetyError('深度检查需要先选择已关联项目')
+    result=_scan(state,safe_ctx,scopes,progress,cancel,deep)
     result['complete']=result['complete'] and not omitted and all(x['status']=='complete' for x in result['coverage'])
     result['scope_omissions']=omitted
     for row in result['items']:
@@ -259,16 +270,20 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
     import ast,struct
     found=[]
     evidence_started=time.monotonic();read_bytes=0
-    def bounded_read(path,limit=512*1024):
+    deep=result.get('scan_profile')=='deep'
+    evidence_bytes=32*1024**2 if deep else 8*1024**2
+    evidence_seconds=20 if deep else 5
+    check_limit=5000 if deep else 500
+    def bounded_read(path,limit=512*1024,header_only=False):
         nonlocal read_bytes
         no_links(path)
         info=path.stat()
         if getattr(info,'st_file_attributes',0)&(CLOUD_FLAGS|0x400):raise SafetyError('云端或链接证据文件，继续保留')
-        size=info.st_size
-        if size>limit or read_bytes+size>8*1024**2 or time.monotonic()-evidence_started>5:
-            result.setdefault('evidence_limits',[]).append({'kind':'生成证据','path':str(path),'reason':'单文件/总读取8MiB/5秒预算达到上限，未识别'})
+        size=min(info.st_size,64) if header_only else info.st_size
+        if size>limit or read_bytes+size>evidence_bytes or time.monotonic()-evidence_started>evidence_seconds:
+            result.setdefault('evidence_limits',[]).append({'kind':'生成证据','path':str(path),'reason':'生成证据单文件或总读取/时间预算达到上限，未识别'})
             raise SafetyError('生成证据读取预算达到上限')
-        with path.open('rb') as stream:data=stream.read(limit+1)
+        with path.open('rb') as stream:data=stream.read(64 if header_only else limit+1)
         read_bytes+=len(data)
         if len(data)>limit:raise SafetyError('证据读取时文件变化')
         return data
@@ -283,7 +298,7 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
                 'category':category or ('bytecode_cache' if path.suffix=='.pyc' else 'test_output'),'keep':False,
                 'stamp':{'ino':s.st_ino,'dev':s.st_dev,'size':s.st_size,'mtime_ns':s.st_mtime_ns}})
         except (OSError,SafetyError):pass
-    for name in result.get('bytecode_paths',[])[:500]:
+    for name in result.get('bytecode_paths',[])[:check_limit]:
         if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消')
         p=Path(name)
         match=re.fullmatch(r'(.+)\.cpython-(312|313|314)(?:\.opt-[12])?\.pyc',p.name)
@@ -304,7 +319,7 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
             add(p,p.parent.parent,'Python 根据仍存在的源码自动生成的字节码缓存；不是源码或唯一编译产物。',
                 '已核对 Python 缓存头及对应源码位置：'+str(source))
         except (OSError,SafetyError):continue
-    for name in result.get('pytest_paths',[])[:500]:
+    for name in result.get('pytest_paths',[])[:check_limit]:
         if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消')
         p=Path(name);cache=p.parent.parent.parent
         try:
@@ -320,24 +335,32 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
             if valid:add(p,cache.parent,'pytest 生成的测试节点/失败记录；移除后会失去上次测试选择信息。',
                          'pytest 缓存目录标记、自动生成 ignore 标记及 JSON 格式均已核对','test_output')
         except (OSError,SafetyError,ValueError,UnicodeError):continue
-    for name in result.get('java_paths',[])[:500]:
+    for name in result.get('java_paths',[])[:check_limit]:
         if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消')
         p=Path(name)
         output=next((parent for parent in p.parents if parent.name in ('classes','test-classes') and parent.parent.name=='target'),None)
-        if output is None:continue
-        scope=output.parent.parent
+        if output is not None:
+            scope=output.parent.parent
+            source_set='main' if output.name=='classes' else 'test'
+            build_file=scope/'pom.xml'
+        else:
+            output=next((parent for parent in p.parents if parent.name in ('main','test') and parent.parent.name=='java' and parent.parent.parent.name=='classes' and parent.parent.parent.parent.name=='build'),None)
+            if output is None:continue
+            scope=output.parents[3];source_set=output.name
+            build_file=next((scope/name for name in ('build.gradle','build.gradle.kts') if (scope/name).is_file()),None)
+            if build_file is None:continue
         relative=p.relative_to(output)
-        source=scope/'src'/('main' if output.name=='classes' else 'test')/'java'/relative.parent/(p.stem.split('$')[0]+'.java')
+        source=scope/'src'/source_set/'java'/relative.parent/(p.stem.split('$')[0]+'.java')
         try:
-            no_links(p);no_links(source);no_links(scope/'pom.xml')
-            if not source.is_file() or not (scope/'pom.xml').is_file():continue
+            no_links(p);no_links(source);no_links(build_file)
+            if not source.is_file() or not build_file.is_file():continue
             if getattr(p.stat(),'st_file_attributes',0)&(CLOUD_FLAGS|0x400):continue
             with p.open('rb') as stream:header=stream.read(10)
             if len(header)!=10 or header[:4]!=b'\xca\xfe\xba\xbe':continue
             minor,major,pool=struct.unpack('>HHH',header[4:10])
             if minor not in (0,65535) or not 52<=major<=69 or pool<1:continue
-            add(p,scope,'Maven 标准输出位置中的 Java 编译缓存；对应源码仍存在。需要运行或交付时请保留。',
-                '已核对 class 格式（Java 8–25）、pom.xml 与对应源码位置：'+str(source),'bytecode_cache')
+            add(p,scope,'Maven/Gradle 标准输出位置中的 Java 编译缓存；对应源码仍存在。需要运行或交付时请保留。',
+                '已核对 class 格式（Java 8–25）、构建文件 '+str(build_file)+' 与对应源码位置：'+str(source),'bytecode_cache')
         except (OSError,SafetyError):continue
     for name in result.get('package_scripts',[])[:20]:
         if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消')
@@ -379,11 +402,13 @@ def discover_generated(result,progress=None,cancel=None,known_artifacts=()):
             if progress:progress('核对项目生成文件与发布清单',files=len(found))
         except (OSError,SafetyError,SyntaxError,ValueError,UnicodeError):continue
     # A current, explicitly retained package is the comparison anchor, not mtime/name.
+    import generated_rules
+    generated_rules.discover(result.get('rule_inputs',[]),bounded_read,add,cancel)
     import zipfile
     def package_identity(path):
         no_links(path)
         if getattr(path.stat(),'st_file_attributes',0)&(CLOUD_FLAGS|0x400):return None
-        if path.stat().st_size>32*1024**2 or time.monotonic()-evidence_started>5:return None
+        if path.stat().st_size>32*1024**2 or time.monotonic()-evidence_started>evidence_seconds:return None
         with zipfile.ZipFile(path) as archive:
             if len(archive.infolist())>2000:return None
             for member in archive.infolist():

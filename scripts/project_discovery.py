@@ -59,6 +59,8 @@ def context(state):
         data['projects'] += [dict(row,source='用户手动登记，仅只读范围') for row in manual if isinstance(row,dict)]
     else:warnings.append({'path':'manual-projects.json','reason':'未知登记结构，跳过'})
     data['discovery_warnings']=warnings
+    relocations=load_object(Path(state)/'project-relocations.json',warnings).get('relocations',[])
+    data['relocations']=relocations if isinstance(relocations,list) else []
     return data
 
 
@@ -81,9 +83,16 @@ def discover(ctx,codex_roots):
     def add(value,source,index_time=None):
         if value is None:return
         try:
+            original=absolute(value) if isinstance(value,str) else None
+            for relocation in ctx.get('relocations',[]):
+                if not isinstance(relocation,dict):continue
+                old=absolute(relocation['from'])
+                if original is not None and within(original,old):
+                    value=str(absolute(relocation['to'])/original.relative_to(old))
+                    source+=' · 用户重新关联';index_time=relocation.get('registered_at');break
             p=valid_project(value,codex_roots)
             proposed.append({'path':str(p),'sources':[source],'index_time':index_time})
-        except (OSError,ValueError,SafetyError) as error:
+        except (OSError,ValueError,SafetyError,KeyError) as error:
             omitted.append({'path':str(value),'reason':str(error)})
     for project in ctx.get('projects',[]) or []:
         if not isinstance(project,dict):continue
@@ -132,10 +141,23 @@ def discover(ctx,codex_roots):
     return result,omitted
 
 
-def register(state,path,codex_roots):
+def register(state,path,codex_roots,relocate_from=None):
     p=valid_project(path,codex_roots)
     if within(p,Path(state)) or within(Path(state),p):raise SafetyError('手动项目不能覆盖工具状态目录')
     if not p.is_dir():raise SafetyError('手动登记需要当前可访问的具体目录')
+    if relocate_from:
+        old=valid_project(relocate_from,codex_roots)
+        known,_=discover(context(state),codex_roots)
+        if str(old) not in {row['path'] for row in known}:raise SafetyError('旧路径不是已关联项目，不能重新关联')
+        if old.exists():raise SafetyError('旧路径仍然存在，请分别核对两个项目')
+        file=Path(state)/'project-relocations.json';warnings=[]
+        data=load_object(file,warnings)
+        if warnings:raise SafetyError('已有重关联记录损坏，保留原样')
+        rows=data.get('relocations',[])
+        if not isinstance(rows,list) or len(rows)>=128:raise SafetyError('重关联记录格式无效或达到上限')
+        rows.append({'from':str(old),'to':str(p),'registered_at':utc_stamp()})
+        write_json(file,{'version':1,'relocations':rows})
+        return {'path':str(p),'previous_path':str(old),'permission':'仅重新关联只读范围，历史清理记录保持原始路径'}
     file=Path(state)/'manual-projects.json'
     warnings=[];data=load_object(file,warnings)
     if warnings:raise SafetyError('已有登记文件无法读取，保留原样')

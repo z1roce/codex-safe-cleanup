@@ -30,3 +30,14 @@ GitHub Actions 只跑指定的只读回归测试（其中仍会创建合成夹�
 
 提交前检查 `git diff --cached`：不提交项目/任务索引、产物登记、运行状态、隔离记录、真实扫描报告、`.env`、缓存或作者的旧 ZIP 包。`.gitignore` 只能减少意外，不能代替检查。
 
+
+
+## 大文件、批量与警告检查
+
+设置 `CLEANUP_LARGE_FILE_TEST=1` 后，运行 `test_file_cleanup.FileCleanupTests.test_real_gib_file_streaming_recycle_restore_bounded_memory`。夹具大小为1GiB+1字节，执行真实Windows回收与恢复，测量Python流式校验的tracemalloc峰值。
+
+设置 `CLEANUP_BULK_BROWSER_TEST=1` 后，运行 `test_scan_panel.PanelTests.test_bulk_browser_partial_failure_resume_and_restore`。它创建105个专用文件，使用真实回收站，第2次回收注入失败，浏览器验证103项选择保留、继续原清单、完整恢复。需要本机Chrome和现有Playwright，测试可能持续数分钟。
+
+完整回归可加 `-W always::ResourceWarning`，检查HTTP错误响应与子进程资源释放。CI的javac测试保留中文空格项目目录，在该目录中使用相对参数，覆盖旧JDK Windows本地代码页问题。编译失败会输出真实stderr及JDK属性，不将失败改为跳过。
+
+新版恢复记录采用固定授权清单、逐文件原子JSON和fsync追加索引。旧版内联manifest仍需恢复兼容测试。修改此协议时必须覆盖暂存前后、原生回收前后、恢复移动后、逐文件记录缺失与继续授权边界。

@@ -190,14 +190,131 @@ FileCleanup(sys.argv[2]).execute(sys.argv[4],ACK)
   hidden.rename(stage);FileCleanup(self.c.state).restore(r['id'])
   self.assertEqual(self.file.read_bytes(),self.data)
 
+ def test_history_paginates_and_reports_corrupt_or_missing_manifests(self):
+  import uuid
+  for index in range(1,36):
+   folder=self.engine.records/uuid.UUID(int=index).hex;folder.mkdir(parents=True)
+   if index==1:(folder/'manifest.json').write_bytes(b'corrupt test record')
+  first=self.engine.history_page()
+  self.assertEqual(len(first['records']),30);self.assertEqual(first['next_offset'],30)
+  second=self.engine.history_page(30)
+  self.assertEqual(len(second['records']),5);self.assertIsNone(second['next_offset'])
+  self.assertTrue(all(row['corrupt'] for row in first['records']+second['records']))
+  self.assertEqual(self.file.read_bytes(),self.data)
+
  def test_stage_permission_failure_does_not_move_source(self):
   preview=self.preview()
   real_mkdir=Path.mkdir
   def denied(path,*args,**kwargs):
-   if self.engine.records in path.parents and path.parent!=self.engine.records:raise PermissionError('synthetic staging denial')
+   if self.engine.records in path.parents and path.parent!=self.engine.records and path.name!='entry-records':raise PermissionError('synthetic staging denial')
    return real_mkdir(path,*args,**kwargs)
   with patch.object(Path,'mkdir',denied):r=self.engine.execute(preview['id'],ACK)
   self.assertTrue(r['failed']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_streaming_time_budget_keeps_source_and_creates_no_authorization(self):
+  with patch('file_cleanup.HASH_SECONDS',-1):
+   with self.assertRaises(SafetyError):self.preview()
+  self.assertEqual(self.file.read_bytes(),self.data)
+  self.assertEqual(list(self.engine.plans.glob('*.json')),[])
+
+ def make_catalogs(self,count):
+  import uuid
+  files=[self.file]
+  for index in range(2,count+1):
+   file=self.file.parent.parent/str(uuid.UUID(int=index))/self.file.name
+   file.parent.mkdir();file.write_bytes(b'disposable batch fixture');files.append(file)
+  return files
+
+ def simulated_recycle(self,mode,path,expected_id,**kwargs):
+  destination=self.base/'simulated-bin'/str(expected_id)/path.name
+  destination.parent.mkdir(parents=True);os.rename(path,destination)
+  return {'ok':True,'recycle_path':str(destination)}
+
+ def simulated_restore(self,record,destination,expected_id):
+  os.rename(record['recycle_path'],destination)
+  return {'ok':True}
+
+ def test_over_100_files_one_fixed_authorization_and_restore(self):
+  files=self.make_catalogs(105);report=inventory.run_inventory(self.c.state)
+  preview=self.engine.preview(report['id'],[r['id'] for r in report['candidates']])
+  self.assertEqual(preview['internal_batches'],2)
+  with patch('windows_recycle.native_operation',side_effect=self.simulated_recycle):
+   result=self.engine.execute(preview['id'],ACK)
+  self.assertEqual(result['success_count'],105);self.assertFalse(result['failed'])
+  self.assertTrue(all(not file.exists() for file in files))
+  with patch('windows_recycle.restore',side_effect=self.simulated_restore):self.engine.restore(result['id'])
+  self.assertTrue(all(file.exists() for file in files))
+
+ def test_resume_preserves_original_scope_after_partial_failure(self):
+  files=self.make_catalogs(4);report=inventory.run_inventory(self.c.state)
+  preview=self.engine.preview(report['id'],[r['id'] for r in report['candidates']])
+  calls=0
+  def failure(*args,**kwargs):
+   nonlocal calls
+   calls+=1
+   return {'ok':False} if calls==2 else self.simulated_recycle(*args,**kwargs)
+  with patch('windows_recycle.native_operation',side_effect=failure):result=self.engine.execute(preview['id'],ACK)
+  self.assertEqual(result['success_count'],1);self.assertEqual(result['unprocessed_count'],2)
+  self.assertEqual(len(result['completed_ids']),1)
+  new=files[-1].with_name('user-assist.json');new.write_bytes(b'new scan must never extend authorization')
+  with patch('windows_recycle.native_operation',side_effect=self.simulated_recycle):
+   resumed=FileCleanup(self.c.state).resume(result['id'],ACK)
+  self.assertEqual(resumed['id'],result['id']);self.assertEqual(resumed['success_count'],3)
+  self.assertEqual(new.read_bytes(),b'new scan must never extend authorization')
+  with patch('windows_recycle.restore',side_effect=self.simulated_restore):self.engine.restore(result['id'])
+  self.assertTrue(all(file.exists() for file in files))
+
+ def test_resume_rejects_appended_files_in_saved_plan(self):
+  self.make_catalogs(2);report=inventory.run_inventory(self.c.state)
+  preview=self.engine.preview(report['id'],[r['id'] for r in report['candidates']])
+  with patch('windows_recycle.native_operation',return_value={'ok':False}):result=self.engine.execute(preview['id'],ACK)
+  from safe_cleanup import read_json
+  file=self.engine.plans/(preview['id']+'.json');plan=read_json(file)
+  plan['entries'].append(dict(plan['entries'][-1],path=str(self.base/'unconfirmed.bin')))
+  write_json(file,plan)
+  with self.assertRaises(SafetyError):self.engine.resume(result['id'],ACK)
+  self.engine.restore(result['id'])
+
+ def test_missing_per_file_journal_is_reported_without_moving_anything(self):
+  with patch('windows_recycle.native_operation',return_value={'ok':False}):result=self.engine.execute(self.preview()['id'],ACK)
+  folder,manifest=self.engine.get(result['id'])
+  path=folder/'entry-records'/(manifest['entries'][0]['id']+'.json');missing=path.with_suffix('.missing')
+  path.rename(missing)
+  with self.assertRaises(SafetyError):self.engine.restore(result['id'])
+  self.assertTrue(self.engine.history()[0]['corrupt'])
+  missing.rename(path);self.engine.restore(result['id']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ def test_v2_manifest_still_restores(self):
+  with patch('windows_recycle.native_operation',return_value={'ok':False}):result=self.engine.execute(self.preview()['id'],ACK)
+  folder,manifest=self.engine.get(result['id']);manifest['version']=2
+  self.engine.save(folder,manifest)
+  FileCleanup(self.c.state).restore(result['id']);self.assertEqual(self.file.read_bytes(),self.data)
+
+ @unittest.skipUnless(os.environ.get('CLEANUP_LARGE_FILE_TEST')=='1','Explicit disposable 1GiB integration test')
+ def test_real_gib_file_streaming_recycle_restore_bounded_memory(self):
+  import tracemalloc
+  file=self.base/'large generated fixture.bin'
+  with file.open('wb') as stream:stream.seek(1024**3);stream.write(b'x')
+  stamp=file.stat()
+  entry={'path':str(file),'scope_root':str(self.base),'task_id':'test','task_title':'GB disposable fixture',
+         'origin':'this test creates a disposable generated file','purpose':'streaming regression','reason':'test only',
+         'impact':'test fixture only','category':'test_output','keep':False,
+         'stamp':{'ino':stamp.st_ino,'dev':stamp.st_dev,'size':stamp.st_size,'mtime_ns':stamp.st_mtime_ns}}
+  write_json(self.c.state/'artifact-registry.json',{'artifacts':[entry]})
+  report=inventory.run_inventory(self.c.state);row=next(r for r in report['candidates'] if r['path']==str(file))
+  events=[]
+  tracemalloc.start()
+  try:
+   preview=self.engine.preview(report['id'],[row['id']],lambda *args,**kwargs:events.append(kwargs))
+   result=self.engine.execute(preview['id'],ACK);self.assertFalse(result['failed'],result)
+   self.engine.restore(result['id'])
+   peak=tracemalloc.get_traced_memory()[1]
+  finally:tracemalloc.stop()
+  self.assertLess(peak,12*1024**2)
+  self.assertTrue(any(event.get('hash_bytes',0)>128*1024**2 for event in events))
+  self.assertEqual(file.stat().st_size,1024**3+1)
+  with file.open('rb') as stream:stream.seek(-1,2);self.assertEqual(stream.read(),b'x')
+  print('1GiB streaming Python peak bytes',peak)
 
  @unittest.skipUnless(os.environ.get('CLEANUP_CROSS_VOLUME_ROOT'),'Dedicated second-volume fixture root required')
  def test_real_multi_volume_batch_recycle_restart_restore(self):

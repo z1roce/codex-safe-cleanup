@@ -3,6 +3,7 @@ inventory-context*.json
 artifact-registry*.json
 discovery-index*.json
 manual-projects*.json
+project-relocations*.json
 installation-manifest.json
 *.install-transaction.json
 *.install-lock

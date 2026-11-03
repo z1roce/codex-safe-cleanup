@@ -11,17 +11,42 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
   page.on('pageerror',e=>errors.push(e.message));
   await page.goto(process.env.PANEL_TEST_URL);
   await page.waitForFunction(()=>document.querySelector('#job').textContent.includes('已就绪'));
+  if(process.env.PANEL_TEST_BULK==='1'){
+   await page.locator('#scan').click();
+   await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('检查完成'));
+   await page.locator('#select-all').click();
+   assert.equal(await page.evaluate(()=>selected.size),105);
+   assert.equal(await page.locator('#candidates input').count(),100);
+   await page.locator('#recycle').click();
+   await page.locator('#cleanup-dialog[open]').waitFor();
+   assert.equal(await page.locator('#cleanup-items > .item').count(),105);
+   await page.locator('#cleanup-consent').check();await page.locator('#cleanup-confirm').click();
+   await page.waitForFunction(()=>document.querySelector('#job').textContent.includes('未尝试 103 项'),{},{timeout:120000});
+   assert.equal(await page.evaluate(()=>selected.size),103);
+   await page.getByText('清理与恢复记录',{exact:true}).click();
+   await page.getByRole('button',{name:'继续原清单未处理文件',exact:true}).click();
+   await page.locator('#cleanup-dialog[open]').waitFor();
+   assert.equal(await page.locator('#cleanup-items > .item').count(),103);
+   await page.locator('#cleanup-consent').check();await page.locator('#cleanup-confirm').click();
+   await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('成功回收 104 项'),{},{timeout:180000});
+   assert.equal(await page.locator('#candidates input:checked').count(),0);
+   await page.locator('#history [data-record-kind="files"]').getByRole('button',{name:'查看恢复清单',exact:true}).click();
+   await page.locator('#consent').check();await page.locator('#restore-confirm').click();
+   await page.waitForFunction(()=>document.querySelector('#job').textContent.includes('恢复操作结束'),{},{timeout:180000});
+   assert.deepEqual(errors,[]);console.log('105 files, native recycle, injected second failure, retained 103 selections, resume and restore passed');
+   return;
+  }
   // Batch planning uses synthetic rows and issues no cleanup request.
   assert.deepEqual(await page.evaluate(()=>{
    const original=window.currentCandidates;
    window.currentCandidates=Array.from({length:105},(_,i)=>({id:String(i),bytes:1024,selectable:true}));
    for(const row of window.currentCandidates)selected.add(row.id);
-   const first=nextBatch();
+   const first=selectedManifest();
    for(const id of first)selected.delete(id);
-   const second=nextBatch();
+   const second=selectedManifest();
    selected.clear();window.currentCandidates=original;
    return [first.length,second.length];
-  }),[100,5]);
+  }),[105,0]);
   for(const viewport of [{width:319,height:690},{width:768,height:600},{width:1280,height:800}]){
    await page.setViewportSize(viewport);
    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
@@ -30,6 +55,13 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
    assert.equal(await page.locator('#eligible').textContent(),'2');
    assert.ok(await page.locator('#elapsed').textContent());
   }
+  await page.locator('#file-search').fill('shell-apps');
+  assert.equal(await page.locator('#candidates input').count(),1);
+  await page.locator('#file-search').fill('');
+  await page.locator('#risk-filter').selectOption('protected');
+  assert.equal(await page.locator('#candidates input').count(),0);
+  await page.locator('#risk-filter').selectOption('all');
+  await page.locator('#size-sort').selectOption('asc');
   const previous=await page.locator('#report').textContent();
   await page.locator('#scan').click();
   await page.waitForFunction(p=>document.querySelector('#report').textContent!==p,previous);
@@ -54,7 +86,7 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
   await page.locator('#cleanup-consent').check();
   assert.equal(await page.locator('#cleanup-confirm').isDisabled(),true);
   await page.locator('#sync-consent').check();await page.locator('#cleanup-confirm').click();
-  await page.waitForFunction(()=>document.querySelector('#job').textContent==='已移入回收站，记录中可以恢复。回收站仍占空间。',{},{timeout:30000});
+  await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('成功回收 2 项'),{},{timeout:30000});
   assert.equal(await page.locator('#candidates input').count(),0);
   await page.getByText('清理与恢复记录',{exact:true}).click();
   await page.locator('#history [data-record-kind="files"]').getByRole('button',{name:'查看恢复清单',exact:true}).click();
@@ -76,6 +108,8 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
   await page.locator('#scan').click();
   await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('检查完成'));
   assert.equal(await page.locator('#project-coverage > .item').count(),1);
+  await page.locator('#deep-scan').click();
+  await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('深度检查完成'));
   assert.deepEqual(errors,[]);
   console.log('Passed responsive 319/768/1280 widths, repeat Codex-only scans, no cleanup, explicit recovery');
  }finally{await browser.close();}
