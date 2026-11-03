@@ -5,6 +5,7 @@ function Find-CleanupPython {
     if ($explicit) { $Candidates = @($explicit) }
     if (!$Candidates) {
         $Candidates = @(
+            (Join-Path (Split-Path -Parent $PSScriptRoot) 'runtime\python.exe'),
             (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
             (Join-Path $env:LOCALAPPDATA 'Python\bin\python3.exe')
         )

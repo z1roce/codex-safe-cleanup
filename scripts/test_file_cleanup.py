@@ -31,6 +31,20 @@ class FileCleanupTests(unittest.TestCase):
   for p in (self.root/'config.toml',self.root/'plugins/cache/test.json',self.root/'cache/unknown.json'):
    with self.assertRaises(SafetyError):self.engine.check(str(p),exists=False)
   with patch.dict(os.environ,CODEX_THREAD_ID=self.tid):self.assertIsNone(inventory.candidate_info(self.file))
+
+ def test_runtime_cache_scan_and_preview_share_git_keep_and_config_protections(self):
+  original=inventory.metadata_signature(self.c.state)
+  c=self.c.cfg();c['protect']=[str(self.file)];self.c.save(c)
+  self.assertNotEqual(original,inventory.metadata_signature(self.c.state))
+  report=inventory.run_inventory(self.c.state);self.assertEqual(report['candidates'],[])
+  self.assertFalse(report['visible_findings'][0]['selectable'])
+  c['protect']=[];self.c.save(c)
+  for status in (None,True):
+   with patch.object(inventory,'git_tracked_status',return_value=status):
+    self.assertEqual(inventory.run_inventory(self.c.state)['candidates'],[])
+    with self.assertRaises(SafetyError):self.engine.check(self.file)
+  (self.file.parent/'.codex-keep').touch()
+  self.assertEqual(inventory.run_inventory(self.c.state)['candidates'],[])
  def test_real_recycle_restore_and_plan_single_use(self):
   p=self.preview()
   with self.assertRaises(SafetyError):self.engine.execute(p['id'],'wrong')

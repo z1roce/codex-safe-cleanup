@@ -11,6 +11,22 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
   page.on('pageerror',e=>errors.push(e.message));
   await page.goto(process.env.PANEL_TEST_URL);
   await page.waitForFunction(()=>document.querySelector('#job').textContent.includes('已就绪'));
+  if(process.env.PANEL_TEST_CURSOR==='1'){
+   await page.locator('#project-filter').selectOption(process.env.PANEL_TEST_PROJECT);
+   await page.locator('#scan').click();
+   await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('检查完成'));
+   assert.equal(await page.locator('#resume-scan').isVisible(),true);
+   await page.reload();
+   await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('已读取'));
+   let segments=0;
+   while(await page.locator('#resume-scan').isVisible()){
+    await page.locator('#resume-scan').click();
+    await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('续查完成'));
+    assert.ok(++segments<10);
+   }
+   assert.ok((await page.locator('#project-summary').textContent()).includes('累计 7 文件'));
+   assert.deepEqual(errors,[]);console.log('persistent cursor, page reload and remaining-range continuation passed');return;
+  }
   if(process.env.PANEL_TEST_BULK==='1'){
    await page.locator('#scan').click();
    await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('检查完成'));
@@ -47,7 +63,7 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
    selected.clear();window.currentCandidates=original;
    return [first.length,second.length];
   }),[105,0]);
-  for(const viewport of [{width:319,height:690},{width:768,height:600},{width:1280,height:800}]){
+  for(const viewport of [{width:319,height:690},{width:768,height:600},{width:1280,height:800},{width:2560,height:1440}]){
    await page.setViewportSize(viewport);
    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
    await page.locator('#scan').click();
@@ -110,6 +126,11 @@ const {chromium}=require(process.env.CLEANUP_PLAYWRIGHT_MODULE||(fs.existsSync(b
   assert.equal(await page.locator('#project-coverage > .item').count(),1);
   await page.locator('#deep-scan').click();
   await page.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('深度检查完成'));
+  const hidpi=await browser.newPage({viewport:{width:1280,height:800},deviceScaleFactor:2});
+  await hidpi.goto(process.env.PANEL_TEST_URL);
+  await hidpi.waitForFunction(()=>document.querySelector('#job').textContent.startsWith('已读取')||document.querySelector('#job').textContent.startsWith('已就绪'));
+  assert.ok(await hidpi.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await hidpi.close();
   assert.deepEqual(errors,[]);
   console.log('Passed responsive 319/768/1280 widths, repeat Codex-only scans, no cleanup, explicit recovery');
  }finally{await browser.close();}

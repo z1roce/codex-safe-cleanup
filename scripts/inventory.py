@@ -16,7 +16,7 @@ from types import SimpleNamespace
 sys.dont_write_bytecode = True
 from safe_cleanup import Cleaner, SafetyError, absolute, no_links, write_json, read_json, within, is_sync, PROTECTED_SUFFIXES, PROTECTED_NAMES, digest
 
-SCOPE_VERSION = 8
+SCOPE_VERSION = 9
 MAX_FILES = 20000
 MAX_SECONDS = 10
 BLOCK_FLAGS = 0x400 | 0x1000 | 0x40000 | 0x400000
@@ -66,16 +66,29 @@ def candidate_info(path, state=None, allow_missing=False):
                 and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', parts[3])
                 and parts[4] in ('shell-apps.json','user-assist.json')
                 and parts[3] != os.environ.get('CODEX_THREAD_ID')):
-            return {'id':uuid.uuid5(uuid.NAMESPACE_URL,str(p)).hex[:16], 'path':str(p),
+            candidate={'id':uuid.uuid5(uuid.NAMESPACE_URL,str(p)).hex[:16], 'path':str(p),
                     'name':'Codex 电脑操作应用清单缓存 · '+parts[4], 'task_id':parts[3],
                     'purpose':'由 Codex 电脑操作功能生成，重新列出应用时可重建；不属于配置、插件或聊天历史。',
                     'impact':'清理后下次需要重新生成清单；仍在使用该任务时请保留。'}
+            if state is None:return candidate
+            row=inspect_cache(candidate,p,state)
+            return row if row['selectable'] else None
     if state is not None:
         for entry in artifact_entries(state):
             if entry.get('path') == str(p):
                 row = inspect_artifact(entry,allow_missing,state=state)
                 return row if row.get('selectable') else None
     return None
+
+
+def inspect_cache(candidate,path,state):
+    info=path.stat()
+    scope=next(root for root in roots() if within(path,root))
+    keep=any(entry.get('path')==str(path) and entry.get('keep') for entry in artifact_entries(state))
+    entry=dict(candidate,scope_root=str(scope),task_title='任务标题未核实',origin='Codex 电脑操作缓存固定格式',
+               reason='已识别应用清单格式，是否仍被引用需要用户核对',category='codex_app_cache',keep=keep,
+               stamp={'ino':info.st_ino,'dev':info.st_dev,'size':info.st_size,'mtime_ns':info.st_mtime_ns})
+    return inspect_artifact(entry,state=state)
 
 
 def artifact_entries(state):
@@ -90,6 +103,8 @@ def artifact_entries(state):
 
 def metadata_signature(state,ctx=None):
     file=Path(state)/'artifact-registry.json'
+    config_file=Path(state)/'config.json'
+    config=read_json(config_file) if config_file.exists() else {}
     indexes=[]
     for root in roots():
         path=root/'.codex-global-state.json'
@@ -98,6 +113,7 @@ def metadata_signature(state,ctx=None):
         except (OSError,SafetyError):indexes.append([str(path),'unavailable'])
     return digest({'context':context(state) if ctx is None else ctx,
                    'local_indexes':indexes,
+                   'protections':{name:config.get(name,[]) for name in ('protect','sync_roots')},
                    'manual_artifacts':read_json(file) if file.exists() else {}})
 
 
@@ -117,12 +133,14 @@ def inspect_artifact(entry,allow_missing=False,state=None):
              bytes=info.st_size,human_name=entry.get('name',p.name),kind='file',status='review',
              selectable=False,confirmed=False,sample_names=[],file_count=1,partial=False,
              file_stamp={'ino':info.st_ino,'dev':info.st_dev,'size':info.st_size,'mtime_ns':info.st_mtime_ns})
-    row['sync_risk']=is_sync(p)
+    config=read_json(Path(state)/'config.json') if state is not None and (Path(state)/'config.json').exists() else {}
+    row['sync_risk']=is_sync(p,config.get('sync_roots',[]))
     blocked=None
     if entry.get('keep'):blocked='当前交付物或明确保留内容，保护'
+    elif any(within(p,absolute(value)) or within(absolute(value),p) for value in config.get('protect',[])):blocked='用户指定保护'
     elif state is not None and any(within(p,absolute(x['path'])) for x in context(state).get('preserve_paths',[])):
         blocked='项目索引中已明确保留的内容，保护'
-    elif entry['category'] not in ('test_output','superseded_package','discarded_tool_download','bytecode_cache','task_dependency_cache'):
+    elif entry['category'] not in ('test_output','superseded_package','discarded_tool_download','bytecode_cache','task_dependency_cache','codex_app_cache'):
         blocked='产物用途未核实，继续保留'
     elif row['file_stamp']!=entry['stamp']:blocked='登记后内容或文件身份变化，重新核实前保留'
     elif not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:blocked='不是独立普通文件，保护'
@@ -167,15 +185,16 @@ def discover(state=None, ctx=None, extra=()):
                                        else 'CODEX_HOME 明确配置的 Codex 目录']} for p in allowed]
 
 
-def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=None,project=None,deep=False):
+def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=None,project=None,deep=False,resume=None):
     state = Cleaner(state).state
     expected = discover(state, extra=extra)
     allowed = [Path(s['path']) for s in expected]
     if scopes is not None and any(absolute(x['path']) not in allowed for x in scopes):
         raise SafetyError('扫描范围必须是核实过的 Codex 数据根；拒绝其他目录')
-    scopes = ([] if project else expected) if scopes is None else scopes
+    scopes = ([] if project or resume else expected) if scopes is None else scopes
     started = time.perf_counter()
     items, skipped, coverage, candidates = [], [], [], []
+    runtime_findings=[]
     total_files = 0
     complete = True
 
@@ -223,11 +242,9 @@ def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=
                             candidate = candidate_info(p)
                             if candidate:
                                 # Windows DirEntry caches may report inode/link count as zero.
-                                identity = p.stat()
-                                if identity.st_nlink == 1:
-                                    candidates.append(dict(candidate, bytes=identity.st_size,
-                                        file_stamp={'ino':identity.st_ino,'dev':identity.st_dev,'size':identity.st_size,'mtime_ns':identity.st_mtime_ns},
-                                        selectable=True, status='review', confirmed=False))
+                                row=inspect_cache(candidate,p,state)
+                                runtime_findings.append(row)
+                                if row['selectable']:candidates.append(row)
                             if len(samples) < 5:
                                 samples.append(str(p.relative_to(root)))
                             if progress and total_files % 200 == 0:
@@ -294,7 +311,10 @@ def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=
     items.sort(key=lambda x:(x['status']!='review', -(x['bytes'] or 0)))
     import project_inventory
     ctx=context(state) if ctx is None else ctx
-    projects=project_inventory.scan_projects(state,ctx,roots(),progress,cancel,project,deep)
+    if resume:
+        saved_cursor=project_inventory.load_cursor(state,resume)
+        project=saved_cursor.get('selected_project');deep=saved_cursor.get('deep',False)
+    projects=project_inventory.scan_projects(state,ctx,roots(),progress,cancel,project,deep,resume)
     generated=project_inventory.discover_generated(projects,progress,cancel,artifact_entries(state))
     discovery_file=state/'discovery-index.json'
     remembered=read_json(discovery_file).get('artifacts',[]) if discovery_file.exists() else []
@@ -325,11 +345,14 @@ def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=
               'selected_project':project,'project_scope_omissions':projects['scope_omissions'],
               'project_skipped':projects['skipped'],
               'scan_profile':projects['scan_profile'],'scan_limits':projects['scan_limits'],
+              'scan_cursor':uuid.uuid4().hex if projects['pending_walks'] else None,
+              'project_cumulative_files':projects['cumulative_files'],'resumed_from':resume,
+              'scan_segment_note':'本段元数据统计。续查固定在原项目范围内，扫描期间新增或变更的已完成目录需重新检查。',
               'evidence_limits':projects.get('evidence_limits',[]),
               'project_index_captured_at':ctx.get('captured_at'),'project_count':len(ctx.get('projects',[])),
               'thread_count':len(ctx.get('threads',[])),'task_artifacts':artifacts,
               'metadata_signature':metadata_signature(state,ctx),'record_state':str(state),
-              'visible_findings':list({x['id']:x for x in [*candidates,*artifacts]}.values()),
+              'visible_findings':list({x['id']:x for x in [*runtime_findings,*candidates,*artifacts]}.values()),
               'size_note':'仅已统计文件的逻辑大小；保护目录未统计，不是整个 .codex 占用或可释放空间。',
               'exclusions':['未扫描 Windows、整盘、常用文件夹或其他软件',
                             '配置、指令、Skills、插件和历史保护；未核实项目文件不获删除许可',
@@ -351,6 +374,16 @@ def run_inventory(state, ctx=None, scopes=None, extra=(), progress=None, cancel=
     for x in skipped:
         lines.append('- 跳过 '+x['path']+'：'+x['reason'])
     Path(report['preview']).write_text('\n'.join(lines), encoding='utf-8')
+    if report['scan_cursor']:
+        cursor={'version':1,'pending':projects['pending_walks'],'selected_project':project,'deep':deep,
+                'cumulative_files':projects['cumulative_files'],'report_id':report['id']}
+        if len(json.dumps(cursor).encode('utf-8'))>4*1024**2:raise SafetyError('续查目录状态超过4MiB，请缩小到具体项目检查')
+        write_json(state/'scan-cursors'/(report['scan_cursor']+'.json'),cursor)
+    if resume:
+        try:no_links(state/'scan-cursors'/(resume+'.json')).unlink()
+        except OSError as error:
+            report['cursor_cleanup_warning']='旧续查记录保留供核对：'+str(error)
+            write_json(folder/(report['id']+'.json'),report)
     return report
 
 
@@ -360,6 +393,7 @@ def main():
     p.add_argument('--scopes', action='store_true')
     p.add_argument('--project', help='只检查已发现项目的完整路径')
     p.add_argument('--deep', action='store_true',help='用户主动深度检查选定项目，最多100万文件/180秒')
+    p.add_argument('--resume-scan',help='按上次报告中的续查编号继续剩余项目范围')
     p.add_argument('--relocate-from',help='明确重新关联已移动的旧项目路径，配合 --register-project')
     p.add_argument('--register-project', help='手动登记具体项目，仅授予只读范围')
     a = p.parse_args()
@@ -373,7 +407,7 @@ def main():
         result = {'scopes':discover(c.state),'projects':projects,'omissions':omitted}
     else:
         with c.locked():
-            result = run_inventory(c.state,project=a.project,deep=a.deep)
+            result = run_inventory(c.state,project=a.project,deep=a.deep,resume=a.resume_scan)
     print(json.dumps(result,ensure_ascii=False))
 
 

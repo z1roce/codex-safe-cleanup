@@ -6,6 +6,12 @@
 
 Conservative, preview-first cleanup for Codex on Windows. Exact files only, explicit consent, native Recycle Bin and recorded recovery. Early alpha, Windows-tested only; not affiliated with OpenAI.
 
+## Windows x64便携包
+
+便携包内含官方CPython3.14.10，解压到任意本地目录后双击 `Start.cmd`，即可打开面板。无需另装Python。可选的 `Install-Skill.cmd` 使用随包解释器安装Skill，安装后也能使用自带运行库。
+
+GitHub Actions通过测试后会生成 `CodexSafeCleanup-Windows-x64.zip` 构建产物，可在最近成功运行页面下载，GitHub要求登录，构建产物保留30天。Python许可证及组件声明随包保留，原生回收站仍使用Windows自带PowerShell。源码、Skill和便携安装之间可升级，配置和恢复记录使用原有独立状态目录。
+
 ## 适合做什么
 
 - 检查当前用户 `.codex`、明确的 `CODEX_HOME`、Codex 本机索引和已登记的项目/任务输出路径。
@@ -17,7 +23,7 @@ Conservative, preview-first cleanup for Codex on Windows. Exact files only, expl
 ## 环境与启动
 
 - Windows；实际开发验证环境为 Windows x64、Python 3.12，本次同时验证 Python 3.14 的完整测试。其他系统/架构未验证。
-- Python **3.12 或更新版本**；主程序只用标准库。回收站通过系统 PowerShell 和 Windows Shell 接口工作，不需要管理员权限。
+- 源码与普通Skill使用 Python **3.12 或更新版本**，便携包附带解释器。主程序只用标准库。回收站通过系统 PowerShell 和 Windows Shell 接口工作，不需要管理员权限。
 - Git 可选；遇到 Git 项目却无法核实跟踪状态时，相关文件继续保护。
 
 下载本仓库 ZIP 并解压，然后双击 `scripts/open-scan-panel.cmd`。启动器逐个验证 Codex 运行库、Python 启动器、PATH、本机安装目录和 Windows 注册表中的解释器，跳过过旧或无法运行的自动候选，并显示最终路径与版本。找不到时安装 Python，或将 `CODEX_CLEANUP_PYTHON` 设为 Python 3.12+ 的完整路径。
@@ -78,4 +84,6 @@ python scripts/inventory.py --register-project "E:\移动后的项目" --relocat
 MIT License。欢迎提供不含私人路径、聊天和凭据的复现步骤；规则宁可漏报，不靠扩大删除范围提高“清理量”。
 
 
-面板提供文件名/路径搜索、项目/类型/风险筛选、大小排序和100项分页。候选大小、选择大小与成功回收量分别展示，实际释放空间未测量。源码和Skill方式继续提供，便携包评估结论见审查记录。
+面板提供文件名/路径搜索、项目/类型/风险筛选、大小排序和100项分页。候选大小、选择大小与成功回收量分别展示，实际释放空间未测量。源码和Skill方式继续提供，便携包构建与实测结果见审查记录。
+
+预算达到上限后可点击“继续剩余范围”，也可运行 `python scripts/inventory.py --resume-scan <报告中的续查编号>`。续查状态持久保存，重启面板或进程后仍可继续。新登记项目不会加入已有续查范围，目录身份或未完成目录发生变化时会要求重新检查。

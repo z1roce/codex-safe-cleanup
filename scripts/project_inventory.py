@@ -2,6 +2,7 @@
 import collections,hashlib,json,os,re,stat,time,uuid
 from pathlib import Path
 from safe_cleanup import Cleaner,SafetyError,absolute,no_links,within,is_sync,read_json
+from project_walk import ProjectWalk
 MAX_FILES=200000
 MAX_SECONDS=30
 MAX_HASH_BYTES=0
@@ -44,7 +45,7 @@ def group_path(p, root):
     return root.joinpath(*parts[:min(2, len(parts))]) if parts else root
 
 
-def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
+def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False,resume=None):
     state = Cleaner(state).state
     file_limit=MAX_FILES*5 if deep else MAX_FILES
     seconds_limit=MAX_SECONDS*6 if deep else MAX_SECONDS
@@ -58,6 +59,7 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
     skipped = []
     count = 0
     budget_hit = False
+    pending={}
     known = {t['id']: t for t in ctx.get('threads', []) if isinstance(t.get('id'),str)}
     explanations = ctx.get('task_explanations', {})
     codex = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
@@ -71,9 +73,11 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
         coverage.append(cover)
         if not root.exists():
             cover['status'] = 'missing'
+            if resume:pending[str(root)]=resume['pending'][str(root)]
             continue
         if budget_hit:
             cover['status'] = 'not_scanned_limit'
+            pending[str(root)]=resume['pending'][str(root)] if resume else ProjectWalk(root,SECRET_NAMES,0x400|CLOUD_FLAGS).checkpoint()
             continue
         try:
             no_links(root)
@@ -86,7 +90,9 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
         def walk_error(e):
             cover['status'] = 'partial'
             problem(getattr(e, 'filename', root), '无法读取：' + str(e))
-        for base, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
+        blocked=SECRET_NAMES|{'.git','.hg','.svn','.agents','skills','plugins','sessions','.codex-cleanup-staging'}
+        walker=ProjectWalk(root,blocked,0x400|CLOUD_FLAGS,resume['pending'][str(root)] if resume else None)
+        for base, dirs, names in walker.walk(walk_error):
             if time.monotonic()-started>=seconds_limit:
                 budget_hit=True;cover.update(status='partial_limit',stopped_at=str(base));break
             if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消；未清理文件')
@@ -100,15 +106,19 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
                     s = p.lstat()
                     if name.lower() in SECRET_NAMES or name.lower() in ('.git', '.hg', '.svn', '.agents', 'skills', 'plugins', 'sessions', '.codex-cleanup-staging'):
                         problem(p, '凭据或版本历史保护，未深入统计')
+                        walker.directory(name,False)
                         continue
                     if stat.S_ISLNK(s.st_mode) or getattr(s, 'st_file_attributes', 0) & (0x400|CLOUD_FLAGS):
                         cover['status'] = 'partial'
                         problem(p, '链接、目录联接或云端占位目录，未深入')
+                        walker.directory(name,False)
                         continue
                     safe_dirs.append(name)
+                    walker.directory(name,True)
                 except OSError as e:
                     cover['status'] = 'partial'
                     problem(p, str(e))
+                    walker.directory(name,False)
             dirs[:] = safe_dirs
             for index,name in enumerate(names):
                 if cancel is not None and cancel.is_set():raise SafetyError('本次项目检查已取消；未清理文件')
@@ -117,6 +127,7 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
                     cover.update(status='partial_limit',stopped_at=str(base/name),unscanned_current_directory_files=len(names)-index)
                     break
                 p = base / name
+                walker.advance(name)
                 try:
                     s = p.lstat()
                     if not stat.S_ISREG(s.st_mode) or stat.S_ISLNK(s.st_mode):
@@ -160,6 +171,7 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
                     problem(p, str(e))
             if budget_hit:
                 break
+        if budget_hit:pending[str(root)]=walker.checkpoint()
     items = []
     for g in groups.values():
         reasons = []
@@ -229,6 +241,8 @@ def _scan(state, ctx=None, scopes=None, progress=None, cancel=None,deep=False):
             report['review_summary'].append(dict(x, bytes=sum(g['bytes'] for g in members),
                 file_count=sum(g['file_count'] for g in members), decision='用途已说明，是否仍需使用待用户判断；继续保留'))
     report['scan_profile']='deep' if deep else 'quick'
+    report['pending_walks']=pending
+    report['cumulative_files']=(resume.get('cumulative_files',0) if resume else 0)+count
     report['scan_limits']={'files':file_limit,'seconds':seconds_limit}
     report['bytecode_paths']=bytecode_paths
     report['package_scripts']=package_scripts
@@ -249,14 +263,38 @@ def discover_projects(ctx,codex_roots):
     return discover(ctx,codex_roots)
 
 
-def scan_projects(state,ctx,codex_roots,progress=None,cancel=None,project=None,deep=False):
+def load_cursor(state,token):
+    if not isinstance(token,str) or not re.fullmatch('[0-9a-f]{32}',token):raise SafetyError('无效续查编号')
+    path=no_links(Path(state)/'scan-cursors'/(token+'.json'))
+    if path.stat().st_size>4*1024**2:raise SafetyError('续查记录超过读取预算')
+    cursor=read_json(path)
+    if not isinstance(cursor,dict) or cursor.get('version')!=1 or not isinstance(cursor.get('pending'),dict):raise SafetyError('续查记录损坏')
+    if not isinstance(cursor.get('deep'),bool) or not isinstance(cursor.get('cumulative_files'),int) or cursor['cumulative_files']<0:raise SafetyError('续查预算或统计记录损坏')
+    for root,saved in cursor['pending'].items():
+        absolute(root)
+        if not isinstance(saved,dict) or not isinstance(saved.get('identity'),dict) or not isinstance(saved.get('stack'),list):raise SafetyError('续查目录状态损坏')
+        for frame in saved['stack']:
+            if not isinstance(frame,dict) or not isinstance(frame.get('path'),str) or (frame.get('after') is not None and not isinstance(frame['after'],str)):
+                raise SafetyError('续查文件位置损坏')
+            if not isinstance(frame.get('safe_dirs',[]),list) or any(not isinstance(name,str) or Path(name).name!=name for name in frame.get('safe_dirs',[])):
+                raise SafetyError('续查子目录清单损坏')
+    return cursor
+
+
+def scan_projects(state,ctx,codex_roots,progress=None,cancel=None,project=None,deep=False,resume=None):
     scopes,omitted=discover_projects(ctx,codex_roots)
+    cursor=load_cursor(state,resume) if resume else None
+    if cursor:
+        available={row['path'] for row in scopes}
+        if set(cursor['pending'])-available:raise SafetyError('续查的项目已不在当前关联范围，停止')
+        scopes=[row for row in scopes if row['path'] in cursor['pending']]
+        project=cursor.get('selected_project');deep=cursor.get('deep',False)
     if project is not None:
         scopes=[scope for scope in scopes if absolute(scope['path'])==absolute(project)]
         if not scopes:raise SafetyError('只能按已发现或手动登记的项目检查')
     safe_ctx=dict(ctx,threads=[dict(t,title=t.get('title') or '任务标题未核实') for t in ctx.get('threads',[])])
     if deep and project is None:raise SafetyError('深度检查需要先选择已关联项目')
-    result=_scan(state,safe_ctx,scopes,progress,cancel,deep)
+    result=_scan(state,safe_ctx,scopes,progress,cancel,deep,cursor)
     result['complete']=result['complete'] and not omitted and all(x['status']=='complete' for x in result['coverage'])
     result['scope_omissions']=omitted
     for row in result['items']:

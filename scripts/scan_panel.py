@@ -89,9 +89,14 @@ class Panel:
         for file in sorted(paths,key=lambda p:p.stat().st_mtime,reverse=True):
             try:
                 report=read_json(file)
+                if report.get('scan_cursor') and not (self.state/'scan-cursors'/(report['scan_cursor']+'.json')).is_file():continue
+                project_only=(report.get('selected_project') is not None or report.get('resumed_from')) and not report.get('coverage')
+                project_paths={row['path'] for row in project_scopes}
+                valid_projects=all(row['path'] in project_paths for row in report.get('project_coverage',[]))
                 if (report.get('scope_version')==inventory.SCOPE_VERSION
                         and report.get('metadata_signature')==expected_signature
-                        and [x['path'] for x in report.get('coverage',[])]==[x['path'] for x in inventory.discover(self.state)]):
+                        and valid_projects
+                        and (project_only or [x['path'] for x in report.get('coverage',[])]==[x['path'] for x in inventory.discover(self.state)])):
                     latest=report;break
             except (OSError,ValueError):continue
         with self.jobs_lock:
@@ -106,7 +111,7 @@ class Panel:
         if command not in ('status', 'scan'):
             raise ValueError('面板只允许扫描和读取状态')
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name('safe_cleanup.py')),
+            [sys.executable,'-X','utf8',str(Path(__file__).with_name('safe_cleanup.py')),
              '--state', str(self.state), command],
             capture_output=True, text=True, encoding='utf-8', timeout=180, check=False,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
@@ -116,12 +121,12 @@ class Panel:
             raise RuntimeError(result.stderr.strip() or '扫描未完成，文件继续保留')
         return json.loads(result.stdout)
 
-    def inventory(self, scopes=False, progress=None, cancel=None,project=None,deep=False):
+    def inventory(self, scopes=False, progress=None, cancel=None,project=None,deep=False,resume=None):
         if scopes:
             return {'scopes':inventory.discover(self.state)}
         with self.cleaner.locked():
             ctx=inventory.context(self.state)
-            report=inventory.run_inventory(self.state,ctx=ctx,progress=progress,cancel=cancel,project=project,deep=deep)
+            report=inventory.run_inventory(self.state,ctx=ctx,progress=progress,cancel=cancel,project=project,deep=deep,resume=resume)
             if report['project_count']!=len(ctx.get('projects',[])) or report['thread_count']!=len(ctx.get('threads',[])):
                 raise SafetyError('项目关联信息没有完整读取，本轮不作为检查成功，请刷新项目索引')
             return report
@@ -172,7 +177,7 @@ class Panel:
                             return self.reply(400, {'error':'无效的操作参数'})
                     if not post and route == '':
                         return self.reply(200, PANEL_HTML.read_text(encoding='utf-8').replace('__NONCE__', panel.token), html=True)
-                    if post and route in ('api/inventory', 'api/inventory-start') and body and (set(body)-{'project','deep'} or ('project' in body and not isinstance(body['project'],str)) or ('deep' in body and not isinstance(body['deep'],bool))):
+                    if post and route in ('api/inventory', 'api/inventory-start') and body and (set(body)-{'project','deep','resume'} or ('project' in body and not isinstance(body['project'],str)) or ('deep' in body and not isinstance(body['deep'],bool)) or ('resume' in body and not isinstance(body['resume'],str))):
                         return self.reply(400, {'error':'只能检查已发现或登记的项目，不能通过网页参数扩展'})
                     if not post and route == 'api/bootstrap':
                         return self.reply(200, panel.bootstrap())
@@ -199,7 +204,7 @@ class Panel:
                             return self.reply(403, {'error':'请先查看恢复清单并明确确认；不会覆盖已有文件'})
                         return self.reply(200, panel.launch_job(lambda progress:(panel.file_cleanup if body.get('kind')=='files' else panel.cleanup).restore(body.get('batch'), progress)))
                     if not post and route == 'api/ping':
-                        return self.reply(200, {'ready': True, 'pid': os.getpid(), 'version': 8})
+                        return self.reply(200, {'ready': True, 'pid': os.getpid(), 'version': 9})
                     if not post and route == 'api/status':
                         s = panel.run('status')
                         scopes = panel.inventory(scopes=True)['scopes']
@@ -209,20 +214,20 @@ class Panel:
                         if not panel.scan_lock.acquire(blocking=False):
                             return self.reply(409, {'error': '已有一次扫描正在进行，请稍候'})
                         try:
-                            return self.reply(200, panel.inventory(project=body.get('project') if body else None,deep=body.get('deep',False) if body else False))
+                            return self.reply(200, panel.inventory(project=body.get('project') if body else None,deep=body.get('deep',False) if body else False,resume=body.get('resume') if body else None))
                         finally:
                             panel.scan_lock.release()
                     if post and route == 'api/inventory':
                         if not panel.scan_lock.acquire(blocking=False):
                             return self.reply(409, {'error': '已有扫描正在进行，请稍候'})
                         try:
-                            return self.reply(200, panel.inventory(project=body.get('project') if body else None,deep=body.get('deep',False) if body else False))
+                            return self.reply(200, panel.inventory(project=body.get('project') if body else None,deep=body.get('deep',False) if body else False,resume=body.get('resume') if body else None))
                         finally:
                             panel.scan_lock.release()
                     if post and route == 'api/inventory-start':
                         cancel = threading.Event()
                         return self.reply(200, panel.launch_job(
-                            lambda progress:panel.inventory(progress=progress, cancel=cancel,project=body.get('project') if body else None,deep=body.get('deep',False) if body else False), 'inventory', cancel))
+                            lambda progress:panel.inventory(progress=progress, cancel=cancel,project=body.get('project') if body else None,deep=body.get('deep',False) if body else False,resume=body.get('resume') if body else None), 'inventory', cancel))
                     if post and route in ('api/inventory-cancel', 'api/cleanup-cancel-preview'):
                         jid = body.get('job')
                         if not isinstance(jid, str):
@@ -262,7 +267,7 @@ def ping(record):
     try:
         with urlopen(url + 'api/ping', timeout=1) as r:
             data = json.load(r)
-        if data.get('ready') and data.get('pid') == record.get('pid') and data.get('version') == 8:
+        if data.get('ready') and data.get('pid') == record.get('pid') and data.get('version') == 9:
             return url
     except (OSError, ValueError):
         pass
@@ -307,7 +312,7 @@ def start(state):
     log = no_links(cleaner.state / 'panel-service.log')
     with log.open('ab') as f:
         child = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), '--serve', '--state', str(cleaner.state)],
+            [sys.executable,'-X','utf8',str(Path(__file__).resolve()), '--serve', '--state', str(cleaner.state)],
             stdin=subprocess.DEVNULL, stdout=f, stderr=f,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'),

@@ -5,5 +5,5 @@ $cleanupPython = Find-CleanupPython
 $cleanupArgs = @('--destination', $Destination)
 if ($Upgrade) { $cleanupArgs += '--upgrade' }
 if ($Recover) { $cleanupArgs += '--recover' }
-& $cleanupPython -B (Join-Path $PSScriptRoot 'install_skill.py') @cleanupArgs
+& $cleanupPython -X utf8 -B (Join-Path $PSScriptRoot 'install_skill.py') @cleanupArgs
 exit $LASTEXITCODE

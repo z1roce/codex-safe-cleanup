@@ -4,6 +4,9 @@ artifact-registry*.json
 discovery-index*.json
 manual-projects*.json
 project-relocations*.json
+scan-cursors/
+runtime/
+portable-build.json
 installation-manifest.json
 *.install-transaction.json
 *.install-lock

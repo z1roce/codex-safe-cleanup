@@ -13,15 +13,23 @@ from safe_cleanup import SafetyError, absolute, key, no_links, read_json, write_
 
 def distribution(source):
     paths=[source/name for name in ('LICENSE','README.md','SKILL.md','CONTRIBUTING.md','SECURITY.md')]
-    for folder in ('scripts','agents','assets','references'):
-        paths.extend(p for p in (source/folder).rglob('*') if p.is_file() and
-                     '__pycache__' not in p.parts and p.suffix!='.pyc')
+    paths.extend(p for p in (source/'scripts').iterdir() if p.is_file() and
+                 (p.suffix.lower() in ('.py','.ps1','.cmd','.cs','.cjs') or p.name=='legacy-install-hashes.json'))
+    for folder,suffixes in (('agents',{'.yaml'}),('assets',{'.html','.css','.js','.svg'}),('references',{'.md'})):
+        paths.extend(p for p in (source/folder).rglob('*') if p.is_file() and p.suffix.lower() in suffixes and
+                     not any(part in ('state','__pycache__','scan-cursors') for part in p.relative_to(source).parts))
+    if (source/'portable-build.json').is_file():
+        paths.extend(source/name for name in ('Start.cmd','Install-Skill.cmd','THIRD-PARTY-NOTICES.txt','portable-build.json'))
+        paths.extend(path for path in (source/'runtime').iterdir() if path.is_file())
     return {str(p.relative_to(source)).replace('\\','/'):p for p in paths}
 
 
 def file_hash(path):
     no_links(path)
-    return hashlib.sha256(path.read_bytes().replace(b'\r\n',b'\n')).hexdigest()
+    data=path.read_bytes()
+    if path.name=='LICENSE' or path.suffix.lower() in ('.py','.ps1','.cmd','.cs','.cjs','.html','.yaml','.yml','.md','.json','.txt','._pth'):
+        data=data.replace(b'\r\n',b'\n')
+    return hashlib.sha256(data).hexdigest()
 
 
 @contextlib.contextmanager
@@ -66,6 +74,7 @@ def install(source,target,upgrade=False):
         raise SafetyError('存在未完成安装，请先按事务记录恢复或核对：'+str(journal))
     with installation_lock(lock):
         if target.exists() and not upgrade:raise SafetyError('已有安装，请使用 -Upgrade')
+        previous={}
         if target.exists():
             identity=no_links(target/'SKILL.md')
             if not identity.is_file() or identity.stat().st_size>256*1024 or not re.search(r'^name:\s*codex-safe-cleanup\s*$',identity.read_text(encoding='utf-8-sig'),re.M):
@@ -88,7 +97,9 @@ def install(source,target,upgrade=False):
         for name,path in files.items():
             dest=stage/name;dest.parent.mkdir(parents=True,exist_ok=True)
             shutil.copy2(path,dest)
-        write_json(stage/'installation-manifest.json',{'version':1,'files':{name:file_hash(path) for name,path in files.items()}})
+        hashes={name:value for name,value in previous.items() if (stage/name).is_file()}
+        hashes.update({name:file_hash(path) for name,path in files.items()})
+        write_json(stage/'installation-manifest.json',{'version':1,'files':hashes})
         write_json(journal,{'target':str(target),'stage':str(stage),'backup':str(backup),'phase':'switching'})
         try:
             if target.exists():os.rename(target,backup)

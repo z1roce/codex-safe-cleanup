@@ -110,7 +110,7 @@ class PanelTests(unittest.TestCase):
 
     def test_scan_cancellation_preserves_sources_and_releases_lock(self):
         original=self.panel.inventory
-        def slow(scopes=False,progress=None,cancel=None,project=None,deep=False):
+        def slow(scopes=False,progress=None,cancel=None,project=None,deep=False,resume=None):
             if scopes:return original(True)
             progress('测试只读扫描')
             if cancel.wait(3):raise inventory.SafetyError('本次扫描已取消')
@@ -192,6 +192,21 @@ class PanelTests(unittest.TestCase):
                 env=dict(os.environ,PANEL_TEST_URL=self.url,PANEL_TEST_BULK='1'),capture_output=True,text=True,encoding='utf-8',timeout=420)
         self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr)
         self.assertTrue(all(file.read_bytes()==b'disposable browser bulk fixture' for file in files))
+
+    @unittest.skipUnless(os.environ.get('CLEANUP_BROWSER_TEST')=='1','Optional installed Chrome test')
+    def test_browser_persistent_scan_cursor_after_page_reload(self):
+        import project_inventory
+        project=self.base/'cursor project';project.mkdir()
+        for index in range(7):(project/f'{index}.txt').write_bytes(b'preserve original')
+        write_json(self.panel.state/'inventory-context.json',{'projects':[{'path':str(project)}],'threads':[]})
+        bundled=Path.home()/'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe'
+        node=os.environ.get('CLEANUP_NODE') or (str(bundled) if bundled.is_file() else shutil.which('node'))
+        self.assertTrue(node,'Browser tests require Node.js')
+        with patch.object(project_inventory,'MAX_FILES',2):
+            result=subprocess.run([str(node),str(Path(__file__).with_name('test_panel_ui.cjs'))],
+                env=dict(os.environ,PANEL_TEST_URL=self.url,PANEL_TEST_CURSOR='1',PANEL_TEST_PROJECT=str(project)),
+                capture_output=True,text=True,encoding='utf-8',timeout=90)
+        self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

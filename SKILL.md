@@ -60,3 +60,10 @@ description: Inspect leftovers across all Codex projects, historical task output
 缓存识别支持 CPython 3.12–3.14 的稳定版格式，未知版本和解释器继续保留。pytest 默认缓存需要生成标记与 JSON 格式证据，Maven Java 编译缓存需要标准输出位置、对应源码、pom.xml 和 class 文件头。识别结果继续经过所有文件保护和用户确认。详细核实与实际验证见 `references/审查与验证.md`。
 
 新增规则集中在 generated_rules.py，支持已核对格式的TypeScript5.9增量状态、mypy1.18缓存、编译数据库精确登记的C/C++目标，Java规则增加Gradle标准布局。截图、预览与历史包继续要求精确来源登记。大文件使用1MiB缓冲、进度和15分钟单次流式校验时间预算。新版逐文件日志兼容旧恢复记录，空暂存目录仅在核实为空时移除。损坏记录在分页恢复列表中明确展示，禁止借修改预览增加授权文件。
+
+
+## 持久续查与便携交付
+
+快速或深度项目扫描达到预算后，使用报告的scan_cursor继续剩余范围。续查保存原项目范围、目录身份、已检查子目录及文件位置，重启后可继续。不能用续查编号扩展到新项目、受保护目录或链接。当前目录发生变化时重新检查。每段报告独立，累计统计不等同于同一时刻的完整磁盘快照。
+
+Windows x64便携包附带校验过的官方Python3.14.10。Start.cmd使用包内解释器，Install-Skill.cmd支持带运行库安装Skill。用户配置与恢复记录仍使用工具独立状态目录。不能把未验证的Python运行库放入分发包。官方包SHA256、许可和构建来源在portable-build.json及THIRD-PARTY-NOTICES.txt保存。
